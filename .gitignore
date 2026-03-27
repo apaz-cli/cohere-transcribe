@@ -7,3 +7,5 @@ vocab.txt
 vocab_txt.h
 model_offsets.h
 transcribe
+transcribe_cuda
+**/*.o

@@ -25,6 +25,7 @@
 #define _GNU_SOURCE
 #include <sys/wait.h>
 #include <pthread.h>
+#include <time.h>
 
 static int verbose = 0;
 
@@ -254,7 +255,8 @@ static void print_tokens(const int *tokens, int start, int end, FILE *out) {
  * transcribe_chunk: run full inference on a sample slice
  * ============================================================ */
 static void transcribe_chunk(const float *samples, int n_samples,
-                              const int *prompt_ids, int n_prompt, FILE *out) {
+                              const int *prompt_ids, int n_prompt, FILE *out,
+                              int *n_tokens_out) {
     const int T_mel = 1 + n_samples / HOP_LEN;
     const int T1    = (T_mel + 1) / 2;
     const int T2    = (T1   + 1) / 2;
@@ -290,7 +292,11 @@ static void transcribe_chunk(const float *samples, int n_samples,
     const size_t arena_floats = n_mel + n_xenc + n_posemb + n_ench
                               + 2*n_cakv + n_hdec + n_mask + work_size;
 
-    float *arena = malloc(arena_floats * sizeof(float));
+    if (verbose) fprintf(stderr, "  chunk %.2fs: T_enc=%d arena=%.1fMB\n",
+                         (float)n_samples / SR, T_enc,
+                         (double)arena_floats * sizeof(float) / (1024.0 * 1024.0));
+
+    float *arena = backend_arena_alloc(arena_floats);
     if (!arena) { fputs("OOM\n", stderr); exit(1); }
 
     size_t off = 0;
@@ -305,7 +311,16 @@ static void transcribe_chunk(const float *samples, int n_samples,
     float *mask   = arena + off; off += n_mask;
     float *work   = arena + off;
 
-    compute_mel(samples, n_samples, T_mel, mel, work);
+    /* Mel is computed on CPU; backend_htod uploads to arena (no-op on CPU). */
+    {
+        float *mel_cpu  = malloc(n_mel * sizeof(float));
+        float *work_cpu = malloc(((size_t)n_samples + WIN_LEN + 1) * sizeof(float));
+        if (!mel_cpu || !work_cpu) { fputs("OOM\n", stderr); exit(1); }
+        compute_mel(samples, n_samples, T_mel, mel_cpu, work_cpu);
+        backend_htod(mel, mel_cpu, n_mel);
+        free(mel_cpu);
+        free(work_cpu);
+    }
     encoder_forward(mel, T_mel, x_enc, T_enc, pos_emb, enc_h, work);
     precompute_ca_kv(enc_h, T_enc, ca_k, ca_v);
 
@@ -320,7 +335,8 @@ static void transcribe_chunk(const float *samples, int n_samples,
     }
 
     print_tokens(tokens, prompt_end, S, out);
-    free(arena);
+    if (n_tokens_out) *n_tokens_out = S - prompt_end;
+    backend_arena_free(arena);
 }
 
 /* ============================================================
@@ -419,6 +435,7 @@ typedef struct {
     int          n_prompt;
     char        *text;      /* written by thread via open_memstream */
     size_t       text_len;
+    int          n_tokens;
 } ChunkWork;
 
 typedef struct {
@@ -438,12 +455,13 @@ static void *worker(void *arg) {
         if (i >= q->n_jobs) break;
         ChunkWork *w = &q->jobs[i];
         FILE *f = open_memstream(&w->text, &w->text_len);
-        transcribe_chunk(w->samples, w->n_samples, w->prompt_ids, w->n_prompt, f);
+        transcribe_chunk(w->samples, w->n_samples, w->prompt_ids, w->n_prompt, f, &w->n_tokens);
         fclose(f);
         pthread_mutex_lock(&q->mu);
         int done = ++q->completed;
         pthread_mutex_unlock(&q->mu);
-        if (verbose) fprintf(stderr, "[%d/%d]\n", done, q->n_jobs);
+        if (verbose) fprintf(stderr, "[%d/%d chunk=%.1fs tokens=%d]\n",
+                             done, q->n_jobs, (float)w->n_samples / SR, w->n_tokens);
     }
     return NULL;
 }
@@ -472,6 +490,7 @@ static void run_chunks_parallel(const float *samples,
     long nthreads = sysconf(_SC_NPROCESSORS_ONLN);
     if (nthreads < 1) nthreads = 1;
     if (nthreads > n_jobs) nthreads = n_jobs;
+    if (verbose) fprintf(stderr, "  running %d chunks on %ld thread(s)\n", n_jobs, nthreads);
     pthread_t *tids = calloc((size_t)nthreads, sizeof(pthread_t));
     if (!tids) { fputs("OOM\n", stderr); exit(1); }
 
@@ -550,8 +569,23 @@ int main(int argc, char **argv) {
     prompt_ids[n_prompt++] = opt_timestamps ? TOK_TIMESTAMP : TOK_NOTIMESTAMP;
     prompt_ids[n_prompt++] = opt_diarize    ? TOK_DIARIZE   : TOK_NODIARIZE;
 
+    if (verbose) {
+        fprintf(stderr, "Options: lang=%s pnc=%d itn=%d timestamps=%d diarize=%d chunk=%d",
+                lang, opt_pnc, opt_itn, opt_timestamps, opt_diarize, opt_chunk);
+        if (opt_chunk)
+            fprintf(stderr, " silence_dur=%.2fs target=%.0fs%s",
+                    opt_silence_dur, opt_target_sec,
+                    isnan(opt_silence_db) ? " silence_db=auto" : "");
+        fputc('\n', stderr);
+    }
+
     if (verbose) fprintf(stderr, "Loading model weights ...\n");
     load_weights();
+    backend_init(0);
+#if defined(BACKEND_CUDA) && !defined(EMBEDDED_MODEL)
+    backend_weights_upload_blob(sf_data, sf_data_bytes);
+    patch_weights_to_device();
+#endif
 
     int n_samples;
     if (verbose) fprintf(stderr, "Loading %s ...\n", audio_file);
@@ -565,14 +599,21 @@ int main(int argc, char **argv) {
             "Use --chunk to split on silence and transcribe in segments.\n",
             (float)n_samples / SR);
         free(samples);
+        backend_destroy();
         return 1;
     }
 
     init_hann();
     init_mel_filterbank();
 
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
     if (!opt_chunk) {
-        transcribe_chunk(samples, n_samples, prompt_ids, n_prompt, stdout);
+        if (verbose) fprintf(stderr, "Transcribing %.2fs single-pass ...\n", (float)n_samples / SR);
+        int n_tokens = 0;
+        transcribe_chunk(samples, n_samples, prompt_ids, n_prompt, stdout, &n_tokens);
+        if (verbose) fprintf(stderr, "  %d tokens\n", n_tokens);
     } else {
         int n_frames = n_samples / HOP_LEN;
         float *frame_rms = malloc(n_frames * sizeof(float));
@@ -600,6 +641,14 @@ int main(int argc, char **argv) {
         run_chunks_parallel(samples, splits, n_splits, n_samples, prompt_ids, n_prompt);
     }
 
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    if (verbose) {
+        double elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
+        fprintf(stderr, "Done in %.2fs (%.1fx realtime)\n",
+                elapsed, (float)n_samples / SR / elapsed);
+    }
+
     free(samples);
+    backend_destroy();
     return 0;
 }
