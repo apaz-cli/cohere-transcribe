@@ -1,0 +1,9 @@
+.venv/**
+test_files/jeff.txt
+test_files/jeff.webm
+test_files/jeff.en.vtt
+model_files/**
+vocab.txt
+vocab_txt.h
+model_offsets.h
+transcribe
