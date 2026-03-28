@@ -47,11 +47,11 @@ static void sf_load(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) { perror(path); exit(1); }
     struct stat st; fstat(fd, &st);
-    uint8_t *m = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    uint8_t *m = (uint8_t*)mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (m == MAP_FAILED) { perror("mmap"); exit(1); }
     uint64_t hs; memcpy(&hs, m, 8);
-    sf_hdr  = malloc(hs + 1);
+    sf_hdr  = (char*)malloc(hs + 1);
     memcpy(sf_hdr, m + 8, hs);
     sf_hdr[hs] = '\0';
     sf_data       = m + 8 + hs;
@@ -320,7 +320,11 @@ static void encoder_forward(const float *mel, int T_mel,
                              float *x_enc, int T_enc,
                              float *pos_emb, float *enc_h, float *work) {
     extern int verbose;
-    if (!backend_graph_replay(GRAPH_TAG_ENCODER, T_enc, 0)) {
+    /* Key the encoder graph by T_mel, not T_enc.  Multiple T_mel values can
+     * produce the same T_enc through the ceiling-division subsampling chain,
+     * so keying by T_enc would replay a graph with stale T_mel-dependent grid
+     * sizes (transpose_mel, conv2d launches) on mismatched mel data. */
+    if (!backend_graph_replay(GRAPH_TAG_ENCODER, T_mel, 0)) {
         backend_graph_begin_capture(GRAPH_TAG_ENCODER);
 
         backend_encoder_subsampling(mel, T_mel, x_enc, T_enc, work, &W);
@@ -328,21 +332,26 @@ static void encoder_forward(const float *mel, int T_mel,
 
         for (int l = 0; l < ENC_N; l++) {
             conformer_layer(x_enc, pos_emb, T_enc, &W.enc[l], work);
+#if !defined(BACKEND_CUDA) && !defined(BACKEND_IRON)
             if (verbose) fprintf(stderr, "  Finished layer %d/%d\n", l+1, ENC_N);
+#endif
         }
 
         backend_linear(enc_h, x_enc, W.prw, W.prb, T_enc, ENC_D, DEC_D);
 
-        backend_graph_end_capture(GRAPH_TAG_ENCODER, T_enc, 0);
+        backend_graph_end_capture(GRAPH_TAG_ENCODER, T_mel, 0);
     }
 }
 
 /* ============================================================
  * Pre-compute cross-attention K/V
  * ============================================================ */
-static void precompute_ca_kv(const float *enc_h, int T_enc,
+static void precompute_ca_kv(const float *enc_h, int T_mel, int T_enc,
                               float *ca_k[DEC_N], float *ca_v[DEC_N]) {
-    if (!backend_graph_replay(GRAPH_TAG_PRECOMPUTE, T_enc, 0)) {
+    /* Key by T_mel: ca_k/ca_v live at T_mel-dependent arena offsets, so two
+     * chunks sharing T_enc but differing in T_mel would otherwise replay a
+     * graph whose captured ca_k/ca_v point into the wrong arena region. */
+    if (!backend_graph_replay(GRAPH_TAG_PRECOMPUTE, T_mel, 0)) {
         backend_graph_begin_capture(GRAPH_TAG_PRECOMPUTE);
 
         for (int l = 0; l < DEC_N; l++) {
@@ -350,71 +359,191 @@ static void precompute_ca_kv(const float *enc_h, int T_enc,
             backend_linear(ca_v[l], enc_h, W.dec[l].ca_vw, W.dec[l].ca_vb, T_enc, DEC_D, DEC_D);
         }
 
-        backend_graph_end_capture(GRAPH_TAG_PRECOMPUTE, T_enc, 0);
+        backend_graph_end_capture(GRAPH_TAG_PRECOMPUTE, T_mel, 0);
     }
 }
 
 /* ============================================================
- * Decoder layer  h (S, DEC_D) → h (S, DEC_D)
+ * Decoder layer with KV cache
+ *
+ * h         (S_q, DEC_D) — query token embeddings (1 during decode, n_prompt during prefill)
+ * sa_k_cache (S_kv, DEC_D) — accumulated self-attn K cache for this layer
+ * sa_v_cache (S_kv, DEC_D) — accumulated self-attn V cache for this layer
+ * S_q       — number of new query tokens being processed
+ * S_kv      — total KV sequence length after this step (S_q tokens appended to prior S_kv-S_q)
+ * mask      — (S_q, S_kv) additive bias, or NULL (pass NULL during decode, S_q==1)
  * ============================================================ */
 static void decoder_layer(float *h, const float *ca_k, const float *ca_v,
-                          const float *mask, int S, int T_enc,
+                          const float *mask, int S_q, int S_kv, int T_enc,
+                          float *sa_k_cache, float *sa_v_cache,
                           const DLayer *L, float *work) {
-    float *ln      = work;
-    float *Q       = work + (size_t)S * DEC_D;
-    float *K       = work + (size_t)2 * S * DEC_D;
-    float *V       = work + (size_t)3 * S * DEC_D;
-    float *attn_out= work + (size_t)4 * S * DEC_D;
-    float *sdp_work= work + (size_t)5 * S * DEC_D;
+    float *ln       = work;
+    float *Q        = work + (size_t)S_q * DEC_D;
+    float *attn_out = work + (size_t)2 * S_q * DEC_D;
+    float *sdp_work = work + (size_t)3 * S_q * DEC_D;
+    /* K/V for the S_q new tokens written directly into the cache at
+     * positions [S_kv - S_q .. S_kv - 1], so all S_kv entries are valid
+     * for the sdp_attn call below. */
+    float *K_new    = sa_k_cache + (size_t)(S_kv - S_q) * DEC_D;
+    float *V_new    = sa_v_cache + (size_t)(S_kv - S_q) * DEC_D;
 
-    /* Self-attention */
-    backend_layernorm(ln, h, L->sa_lnw, L->sa_lnb, S, DEC_D);
-    backend_linear(Q, ln, L->sa_qw, L->sa_qb, S, DEC_D, DEC_D);
-    backend_linear(K, ln, L->sa_kw, L->sa_kb, S, DEC_D, DEC_D);
-    backend_linear(V, ln, L->sa_vw, L->sa_vb, S, DEC_D, DEC_D);
-    backend_sdp_attn(attn_out, Q, K, V, mask, S, S, sdp_work);
-    backend_linear_fmadd(h, 1.0f, attn_out, L->sa_ow, L->sa_ob, S, DEC_D, DEC_D);
+    /* Self-attention: Q over S_q tokens, K/V over full cache (S_kv tokens) */
+    backend_layernorm(ln, h, L->sa_lnw, L->sa_lnb, S_q, DEC_D);
+    backend_linear(Q,     ln, L->sa_qw, L->sa_qb, S_q, DEC_D, DEC_D);
+    backend_linear(K_new, ln, L->sa_kw, L->sa_kb, S_q, DEC_D, DEC_D);
+    backend_linear(V_new, ln, L->sa_vw, L->sa_vb, S_q, DEC_D, DEC_D);
+    backend_sdp_attn(attn_out, Q, sa_k_cache, sa_v_cache, mask, S_q, S_kv, sdp_work);
+    backend_linear_fmadd(h, 1.0f, attn_out, L->sa_ow, L->sa_ob, S_q, DEC_D, DEC_D);
 
     /* Cross-attention */
-    backend_layernorm(ln, h, L->ca_lnw, L->ca_lnb, S, DEC_D);
-    backend_linear(Q, ln, L->ca_qw, L->ca_qb, S, DEC_D, DEC_D);
-    backend_sdp_attn(attn_out, Q, ca_k, ca_v, NULL, S, T_enc, sdp_work);
-    backend_linear_fmadd(h, 1.0f, attn_out, L->ca_ow, L->ca_ob, S, DEC_D, DEC_D);
+    backend_layernorm(ln, h, L->ca_lnw, L->ca_lnb, S_q, DEC_D);
+    backend_linear(Q, ln, L->ca_qw, L->ca_qb, S_q, DEC_D, DEC_D);
+    backend_sdp_attn(attn_out, Q, ca_k, ca_v, NULL, S_q, T_enc, sdp_work);
+    backend_linear_fmadd(h, 1.0f, attn_out, L->ca_ow, L->ca_ob, S_q, DEC_D, DEC_D);
 
     /* FFN */
-    float *mid = Q;  /* reuse Q after Q consumed */
-    backend_layernorm(ln, h, L->ffn_lnw, L->ffn_lnb, S, DEC_D);
-    backend_linear_relu(mid, ln, L->ffn_w1, L->ffn_b1, S, DEC_D, DEC_FF);
-    backend_linear_fmadd(h, 1.0f, mid, L->ffn_w2, L->ffn_b2, S, DEC_FF, DEC_D);
+    float *mid = Q;  /* reuse Q after consumed */
+    backend_layernorm(ln, h, L->ffn_lnw, L->ffn_lnb, S_q, DEC_D);
+    backend_linear_relu(mid, ln, L->ffn_w1, L->ffn_b1, S_q, DEC_D, DEC_FF);
+    backend_linear_fmadd(h, 1.0f, mid, L->ffn_w2, L->ffn_b2, S_q, DEC_FF, DEC_D);
+}
+
+/* ============================================================
+ * Decoder layer (device-side S variant): processes a single query token.
+ *
+ * Uses backend_linear_to_kvcache to write K/V at slot (*g_dev_S - 1), and
+ * backend_sdp_attn_devS to attend over the full cache (T_k = *g_dev_S).
+ * backend_decode_inc_S() must have already run before any call to this layer.
+ * Cross-attention T_enc is a compile-time-visible scalar — baked into the
+ * captured graph but correct because the graph is keyed by T_mel→T_enc.
+ * ============================================================ */
+static void decoder_layer_decode(float *h, const float *ca_k, const float *ca_v,
+                                  int T_enc,
+                                  float *sa_k_cache, float *sa_v_cache,
+                                  const DLayer *L, float *work) {
+    float *ln       = work;
+    float *Q        = work + (size_t)DEC_D;
+    float *attn_out = work + (size_t)2 * DEC_D;
+    float *sdp_work = work + (size_t)3 * DEC_D;  /* needs MAX_SEQ floats for scores */
+
+    /* Self-attention: Q from this token, K/V written to cache at *g_dev_S-1 slot */
+    backend_layernorm(ln, h, L->sa_lnw, L->sa_lnb, 1, DEC_D);
+    backend_linear(Q, ln, L->sa_qw, L->sa_qb, 1, DEC_D, DEC_D);
+    backend_linear_to_kvcache(sa_k_cache, ln, L->sa_kw, L->sa_kb, DEC_D, DEC_D);
+    backend_linear_to_kvcache(sa_v_cache, ln, L->sa_vw, L->sa_vb, DEC_D, DEC_D);
+    backend_sdp_attn_devS(attn_out, Q, sa_k_cache, sa_v_cache, sdp_work);
+    backend_linear_fmadd(h, 1.0f, attn_out, L->sa_ow, L->sa_ob, 1, DEC_D, DEC_D);
+
+    /* Cross-attention: T_enc is fixed per chunk, baked into graph at capture time */
+    backend_layernorm(ln, h, L->ca_lnw, L->ca_lnb, 1, DEC_D);
+    backend_linear(Q, ln, L->ca_qw, L->ca_qb, 1, DEC_D, DEC_D);
+    backend_sdp_attn(attn_out, Q, ca_k, ca_v, NULL, 1, T_enc, sdp_work);
+    backend_linear_fmadd(h, 1.0f, attn_out, L->ca_ow, L->ca_ob, 1, DEC_D, DEC_D);
+
+    /* FFN */
+    float *mid = Q;
+    backend_layernorm(ln, h, L->ffn_lnw, L->ffn_lnb, 1, DEC_D);
+    backend_linear_relu(mid, ln, L->ffn_w1, L->ffn_b1, 1, DEC_D, DEC_FF);
+    backend_linear_fmadd(h, 1.0f, mid, L->ffn_w2, L->ffn_b2, 1, DEC_FF, DEC_D);
 }
 
 /* ============================================================
  * Decoder step: tokens[S] → next token id (greedy argmax)
+ *
+ * S_q: number of new tokens to process this step.
+ *   S_q == S  (prefill): embed all S prompt tokens, populate KV cache from scratch.
+ *   S_q == 1  (decode):  embed only the last token (tokens[S-1]) at absolute
+ *                        position S-1, append one new K/V entry to each cache.
+ *
+ * During decode (S_q==1) the self-attention causal mask is skipped: a single
+ * query token attends to all prior cached positions unconditionally.
  * ============================================================ */
-static int decoder_step(const int *tokens, int S, int T_enc,
+static int decoder_step(const int *tokens, int S, int S_q, int T_mel, int T_enc,
                         float *ca_k[DEC_N], float *ca_v[DEC_N],
+                        float *sa_k_cache[DEC_N], float *sa_v_cache[DEC_N],
                         float *h, float *mask, float *work) {
     float *dev_logits = work;  /* reuse work; VOCAB << work_size */
 
-    /* Upload tokens to stable device buffer before graph capture / replay. */
-    backend_upload_tokens(tokens, S);
+    /* Upload only the S_q new tokens; they land at g_dev_tokens[0..S_q-1]. */
+    backend_upload_tokens(tokens + (S - S_q), S_q);
 
-    if (!backend_graph_replay(GRAPH_TAG_DECODER, T_enc, S)) {
+    /* Key the decoder graph by T_mel (not T_enc).  ca_k/ca_v and h live at
+     * T_mel-dependent arena offsets, so two chunks sharing T_enc but differing
+     * in T_mel would otherwise replay a graph whose captured pointers point
+     * into the wrong arena region. */
+    if (!backend_graph_replay(GRAPH_TAG_DECODER, T_mel, S)) {
         backend_graph_begin_capture(GRAPH_TAG_DECODER);
 
-        backend_embed(h, tokens, S, W.etw, W.epw, W.elnw, W.elnb);
-        backend_fill_causal_mask(mask, S);
+        /* Embed S_q tokens at absolute positions [S-S_q .. S-1]. */
+        backend_embed(h, tokens + (S - S_q), S_q, S - S_q,
+                      W.etw, W.epw, W.elnw, W.elnb);
+        /* Causal mask only needed for prefill where multiple queries are present. */
+        if (S_q > 1)
+            backend_fill_causal_mask(mask, S_q);
 
         for (int l = 0; l < DEC_N; l++)
-            decoder_layer(h, ca_k[l], ca_v[l], mask, S, T_enc, &W.dec[l], work);
+            decoder_layer(h, ca_k[l], ca_v[l], S_q > 1 ? mask : NULL,
+                          S_q, S, T_enc, sa_k_cache[l], sa_v_cache[l],
+                          &W.dec[l], work);
 
-        backend_layernorm(h, h, W.dlnw, W.dlnb, S, DEC_D);
-        backend_lm_head(dev_logits, h + (size_t)(S-1) * DEC_D, W.etw, W.hdb);
+        backend_layernorm(h, h, W.dlnw, W.dlnb, S_q, DEC_D);
+        backend_lm_head(dev_logits, h + (size_t)(S_q - 1) * DEC_D, W.etw, W.hdb);
 
-        backend_graph_end_capture(GRAPH_TAG_DECODER, T_enc, S);
+        backend_graph_end_capture(GRAPH_TAG_DECODER, T_mel, S);
     }
 
     /* DtoH and argmax are always outside the captured region. */
+    float logits_cpu[VOCAB];
+    backend_dtoh(logits_cpu, dev_logits, VOCAB * sizeof(float));
+
+    int best_id = 0; float best = logits_cpu[0];
+    for (int v = 1; v < VOCAB; v++)
+        if (logits_cpu[v] > best) { best = logits_cpu[v]; best_id = v; }
+    return best_id;
+}
+
+/* ============================================================
+ * Decoder step using device-side S counter (decode only, not prefill).
+ *
+ * A single CUDA graph keyed (GRAPH_TAG_DECODER, T_mel, -1) serves every
+ * decode step: backend_decode_inc_S() fires first so all subsequent kernels
+ * in the body see the post-increment *g_dev_S.  On CPU/IRON this reduces to
+ * plain scalar increments with no overhead.
+ *
+ * next_token: the token produced by the previous step (or prefill).
+ * Caller must have called backend_decode_set_S(n_prompt) before the first
+ * call to this function for the current chunk.
+ * ============================================================ */
+static int decoder_step_decode(int next_token, int T_mel, int T_enc,
+                               float *ca_k[DEC_N], float *ca_v[DEC_N],
+                               float *sa_k_cache[DEC_N], float *sa_v_cache[DEC_N],
+                               float *h, float *work) {
+    float *dev_logits = work;  /* VOCAB floats; reused from scratch before lm_head */
+
+    /* Stage the single new token to device (outside capture). */
+    int tok[1] = { next_token };
+    backend_upload_tokens(tok, 1);
+
+    /* Sentinel S=-1 never collides with prefill key (S=n_prompt≥1) or old
+     * per-step decode keys (S≥2). */
+    if (!backend_graph_replay(GRAPH_TAG_DECODER, T_mel, -1)) {
+        backend_graph_begin_capture(GRAPH_TAG_DECODER);
+
+        /* Increment must be the first captured kernel so all subsequent
+         * kernels see *g_dev_S == new sequence length. */
+        backend_decode_inc_S();
+        backend_embed_decode(h, W.etw, W.epw, W.elnw, W.elnb);
+
+        for (int l = 0; l < DEC_N; l++)
+            decoder_layer_decode(h, ca_k[l], ca_v[l], T_enc,
+                                 sa_k_cache[l], sa_v_cache[l], &W.dec[l], work);
+
+        backend_layernorm(h, h, W.dlnw, W.dlnb, 1, DEC_D);
+        backend_lm_head(dev_logits, h, W.etw, W.hdb);
+
+        backend_graph_end_capture(GRAPH_TAG_DECODER, T_mel, -1);
+    }
+
     float logits_cpu[VOCAB];
     backend_dtoh(logits_cpu, dev_logits, VOCAB * sizeof(float));
 

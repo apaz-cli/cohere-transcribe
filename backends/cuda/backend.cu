@@ -36,19 +36,22 @@ extern "C" {
 /* Device state                                                  */
 /* ============================================================ */
 
-static cudaStream_t  g_stream;
-static void         *g_dev_blob;       /* device copy of safetensors data */
-static const void   *g_host_blob_base; /* mmap'd host base for offset calc */
+/* Per-GPU: weights blob uploaded once before any threads start. */
+#define MAX_DEVICES 8
+static void        *g_dev_blob[MAX_DEVICES];   /* device copy of safetensors data */
+static int          g_num_devices = 0;
+static const void  *g_host_blob_base;          /* mmap'd host base for offset calc */
 
-/* Persistent arena: reused across chunks; grows (and invalidates graphs) only
- * when a larger chunk needs more memory. */
-static float        *g_arena       = NULL;
-static size_t        g_arena_bytes = 0;
+/* Per-thread state: each worker thread owns its own CUDA resources. */
+static thread_local cudaStream_t  g_stream        = NULL;
+static thread_local float        *g_arena         = NULL;
+static thread_local size_t        g_arena_bytes    = 0;
+static thread_local int          *g_dev_tokens     = NULL;
+static thread_local int          *g_dev_S          = NULL;  /* device-side sequence counter */
+static thread_local int           g_device_id      = -1;
+static thread_local int           g_capture_tag    = -1;
 
-/* Persistent token buffer: stable device pointer captured inside graphs. */
-static int          *g_dev_tokens  = NULL;
-
-/* ---- Graph cache ---- */
+/* ---- Graph cache (per-thread) ---- */
 #define GRAPH_CACHE_CAP 1026   /* 1 encoder + 1 precompute + up to MAX_SEQ decoder */
 
 typedef struct {
@@ -60,8 +63,8 @@ typedef struct {
     cudaGraphExec_t  exec;
 } GraphEntry;
 
-static GraphEntry g_graph_cache[GRAPH_CACHE_CAP];
-static int        g_graph_cache_n = 0;
+static thread_local GraphEntry g_graph_cache[GRAPH_CACHE_CAP];
+static thread_local int        g_graph_cache_n = 0;
 
 static void graph_invalidate_all(void) {
     for (int i = 0; i < g_graph_cache_n; i++) {
@@ -81,35 +84,67 @@ static GraphEntry *graph_find(int tag, int T_enc, int S) {
     return NULL;
 }
 
+/* Convert a host blob pointer to the current thread's device pointer. */
+static inline const void *dev_w(const void *host_ptr) {
+    if (!host_ptr) return NULL;
+    ptrdiff_t off = (const uint8_t *)host_ptr - (const uint8_t *)g_host_blob_base;
+    return (const uint8_t *)g_dev_blob[g_device_id] + off;
+}
+
 /* ============================================================ */
 /* Lifecycle                                                     */
 /* ============================================================ */
 
+extern "C" int backend_num_devices(void) {
+    return g_num_devices;
+}
+
 extern "C" void backend_init(int device_id) {
+    g_device_id = device_id;
     CUDA_CHECK(cudaSetDevice(device_id));
     CUDA_CHECK(cudaStreamCreate(&g_stream));
     CUDA_CHECK(cudaMalloc(&g_dev_tokens, MAX_SEQ * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&g_dev_S, sizeof(int)));
+}
+
+extern "C" void backend_thread_cleanup(void) {
+    if (g_device_id < 0) return;
+    CUDA_CHECK(cudaSetDevice(g_device_id));
+    graph_invalidate_all();
+    if (g_arena)      { CUDA_CHECK(cudaFree(g_arena));      g_arena = NULL; g_arena_bytes = 0; }
+    if (g_dev_tokens) { CUDA_CHECK(cudaFree(g_dev_tokens)); g_dev_tokens = NULL; }
+    if (g_dev_S)      { CUDA_CHECK(cudaFree(g_dev_S));      g_dev_S = NULL; }
+    if (g_stream)     { CUDA_CHECK(cudaStreamDestroy(g_stream)); g_stream = NULL; }
+    g_device_id = -1;
 }
 
 extern "C" void backend_destroy(void) {
-    graph_invalidate_all();
-    if (g_arena)      { CUDA_CHECK(cudaFree(g_arena));      g_arena      = NULL; g_arena_bytes = 0; }
-    if (g_dev_tokens) { CUDA_CHECK(cudaFree(g_dev_tokens)); g_dev_tokens = NULL; }
-    if (g_dev_blob)   { CUDA_CHECK(cudaFree(g_dev_blob));   g_dev_blob   = NULL; }
-    CUDA_CHECK(cudaStreamDestroy(g_stream));
+    backend_thread_cleanup();  /* clean up main thread's per-thread resources */
+    for (int d = 0; d < g_num_devices; d++) {
+        if (g_dev_blob[d]) {
+            CUDA_CHECK(cudaSetDevice(d));
+            CUDA_CHECK(cudaFree(g_dev_blob[d]));
+            g_dev_blob[d] = NULL;
+        }
+    }
+    g_num_devices = 0;
 }
 
 extern "C" void backend_weights_upload_blob(const void *host_base, size_t bytes) {
     g_host_blob_base = host_base;
-    CUDA_CHECK(cudaMalloc(&g_dev_blob, bytes));
-    CUDA_CHECK(cudaMemcpyAsync(g_dev_blob, host_base, bytes,
-                               cudaMemcpyHostToDevice, g_stream));
-    CUDA_CHECK(cudaStreamSynchronize(g_stream));
+    int n = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&n));
+    g_num_devices = (n > MAX_DEVICES) ? MAX_DEVICES : n;
+    for (int d = 0; d < g_num_devices; d++) {
+        CUDA_CHECK(cudaSetDevice(d));
+        CUDA_CHECK(cudaMalloc(&g_dev_blob[d], bytes));
+        CUDA_CHECK(cudaMemcpy(g_dev_blob[d], host_base, bytes, cudaMemcpyHostToDevice));
+    }
 }
 
 extern "C" void *backend_device_ptr(const void *host_ptr) {
     ptrdiff_t off = (const uint8_t *)host_ptr - (const uint8_t *)g_host_blob_base;
-    return (uint8_t *)g_dev_blob + off;
+    return (uint8_t *)g_dev_blob[g_device_id] + off;
 }
 
 extern "C" float *backend_arena_alloc(size_t floats) {
@@ -199,7 +234,9 @@ extern "C" void backend_layernorm(float *dst, const float *src,
                                    int T, int D) {
     int threads = (D < 256) ? 64 : 256;
     layernorm_k<<<T, threads, 0, g_stream>>>(
-        dst, src, (const __nv_bfloat16 *)w, (const __nv_bfloat16 *)b, T, D);
+        dst, src,
+        (const __nv_bfloat16 *)dev_w(w), (const __nv_bfloat16 *)dev_w(b),
+        T, D);
 }
 
 /* ============================================================ */
@@ -262,7 +299,9 @@ extern "C" void backend_linear(float *y, const float *x,
                                  int T, int in_d, int out_d) {
     dim3 grid(T, (out_d + 255) / 256);
     linear_k<<<grid, 256, 0, g_stream>>>(
-        y, x, (const __nv_bfloat16 *)W, (const __nv_bfloat16 *)b, T, in_d, out_d);
+        y, x,
+        (const __nv_bfloat16 *)dev_w(W), (const __nv_bfloat16 *)dev_w(b),
+        T, in_d, out_d);
 }
 
 extern "C" void backend_linear_silu(float *y, const float *x,
@@ -270,7 +309,9 @@ extern "C" void backend_linear_silu(float *y, const float *x,
                                       int T, int in_d, int out_d) {
     dim3 grid(T, (out_d + 255) / 256);
     linear_silu_k<<<grid, 256, 0, g_stream>>>(
-        y, x, (const __nv_bfloat16 *)W, (const __nv_bfloat16 *)b, T, in_d, out_d);
+        y, x,
+        (const __nv_bfloat16 *)dev_w(W), (const __nv_bfloat16 *)dev_w(b),
+        T, in_d, out_d);
 }
 
 extern "C" void backend_linear_relu(float *y, const float *x,
@@ -278,7 +319,9 @@ extern "C" void backend_linear_relu(float *y, const float *x,
                                       int T, int in_d, int out_d) {
     dim3 grid(T, (out_d + 255) / 256);
     linear_relu_k<<<grid, 256, 0, g_stream>>>(
-        y, x, (const __nv_bfloat16 *)W, (const __nv_bfloat16 *)b, T, in_d, out_d);
+        y, x,
+        (const __nv_bfloat16 *)dev_w(W), (const __nv_bfloat16 *)dev_w(b),
+        T, in_d, out_d);
 }
 
 extern "C" void backend_linear_fmadd(float *acc, float scale, const float *x,
@@ -286,7 +329,9 @@ extern "C" void backend_linear_fmadd(float *acc, float scale, const float *x,
                                        int T, int in_d, int out_d) {
     dim3 grid(T, (out_d + 255) / 256);
     linear_fmadd_k<<<grid, 256, 0, g_stream>>>(
-        acc, scale, x, (const __nv_bfloat16 *)W, (const __nv_bfloat16 *)b, T, in_d, out_d);
+        acc, scale, x,
+        (const __nv_bfloat16 *)dev_w(W), (const __nv_bfloat16 *)dev_w(b),
+        T, in_d, out_d);
 }
 
 /* ============================================================ */
@@ -412,12 +457,12 @@ extern "C" void backend_rel_pos_mhsa(float *x, const float *pos_emb,
     for (int h = 0; h < ENC_H; h++) {
         /* ac scores */
         mhsa_ac_k<<<dim3(T, (T+255)/256), 256, 0, g_stream>>>(
-            scores, Q, K, (const __nv_bfloat16 *)L->sa_pbu,
+            scores, Q, K, (const __nv_bfloat16 *)dev_w(L->sa_pbu),
             scale, T, h, ENC_DK, ENC_D);
 
         /* bd scores with rel-shift, added into scores */
         mhsa_bd_k<<<dim3(T, (T+255)/256), 256, 0, g_stream>>>(
-            scores, Q, P, (const __nv_bfloat16 *)L->sa_pbv,
+            scores, Q, P, (const __nv_bfloat16 *)dev_w(L->sa_pbv),
             scale, T, pos_len, h, ENC_DK, ENC_D);
 
         /* softmax over k */
@@ -485,15 +530,15 @@ extern "C" void backend_conformer_conv(float *x, int T, const ELayer *L, float *
         dim3 grid(T, (ENC_D + 255)/256);
         depthwise_conv1d_k<<<grid, 256, 0, g_stream>>>(
             dw_out, glu_out,
-            (const __nv_bfloat16 *)L->cv_dww, (const __nv_bfloat16 *)L->cv_dwb,
+            (const __nv_bfloat16 *)dev_w(L->cv_dww), (const __nv_bfloat16 *)dev_w(L->cv_dwb),
             T, ENC_D, ENC_CK, pad);
     }
     {
         dim3 grid(T, (ENC_D + 255)/256);
         batchnorm_silu_k<<<grid, 256, 0, g_stream>>>(
             dw_out,
-            (const __nv_bfloat16 *)L->cv_bnw,   (const __nv_bfloat16 *)L->cv_bnb,
-            (const __nv_bfloat16 *)L->cv_bnmean, (const __nv_bfloat16 *)L->cv_bnvar,
+            (const __nv_bfloat16 *)dev_w(L->cv_bnw),   (const __nv_bfloat16 *)dev_w(L->cv_bnb),
+            (const __nv_bfloat16 *)dev_w(L->cv_bnmean), (const __nv_bfloat16 *)dev_w(L->cv_bnvar),
             T, ENC_D);
     }
 
@@ -554,7 +599,7 @@ static void launch_conv2d(float *out, const float *in,
     dim3 grid(out_c, out_h, (out_w + BW - 1) / BW);
     conv2d_k<<<grid, BW, 0, g_stream>>>(
         out, in,
-        (const __nv_bfloat16 *)Wf, (const __nv_bfloat16 *)bf_,
+        (const __nv_bfloat16 *)dev_w(Wf), (const __nv_bfloat16 *)dev_w(bf_),
         in_c, in_h, in_w, out_c, kH, kW, stride, pad, groups);
 }
 
@@ -682,15 +727,15 @@ extern "C" void backend_sdp_attn(float *out, const float *q, const float *k, con
 
 __global__ void embed_k(float *h, const int *tokens,
                          const __nv_bfloat16 *etw, const __nv_bfloat16 *epw,
-                         int S, int D) {
+                         int S, int D, int pos_start) {
     int t = blockIdx.x, d = blockIdx.y * blockDim.x + threadIdx.x;
     if (t >= S || d >= D) return;
     int id = tokens[t];
     h[(size_t)t*D + d] = __bfloat162float(etw[(size_t)id*D + d])
-                        + __bfloat162float(epw[(size_t)t *D + d]);
+                        + __bfloat162float(epw[(size_t)(pos_start + t)*D + d]);
 }
 
-extern "C" void backend_embed(float *h, const int *tokens, int S,
+extern "C" void backend_embed(float *h, const int *tokens, int S, int pos_start,
                                 const uint16_t *etw, const uint16_t *epw,
                                 const uint16_t *elnw, const uint16_t *elnb) {
     /* tokens must have been staged to g_dev_tokens via backend_upload_tokens()
@@ -700,8 +745,8 @@ extern "C" void backend_embed(float *h, const int *tokens, int S,
         dim3 grid(S, (DEC_D + 255)/256);
         embed_k<<<grid, 256, 0, g_stream>>>(
             h, g_dev_tokens,
-            (const __nv_bfloat16 *)etw, (const __nv_bfloat16 *)epw,
-            S, DEC_D);
+            (const __nv_bfloat16 *)dev_w(etw), (const __nv_bfloat16 *)dev_w(epw),
+            S, DEC_D, pos_start);
     }
     backend_layernorm(h, h, elnw, elnb, S, DEC_D);
 }
@@ -733,17 +778,13 @@ extern "C" void backend_lm_head(float *logits_out, const float *last,
                                   const uint16_t *etw, const uint16_t *hdb) {
     lm_head_k<<<(VOCAB + 255) / 256, 256, 0, g_stream>>>(
         logits_out, last,
-        (const __nv_bfloat16 *)etw, (const __nv_bfloat16 *)hdb,
+        (const __nv_bfloat16 *)dev_w(etw), (const __nv_bfloat16 *)dev_w(hdb),
         VOCAB, DEC_D);
 }
 
 /* ============================================================ */
 /* CUDA Graph capture / replay                                   */
 /* ============================================================ */
-
-/* Capture tag for the graph currently being recorded.
- * -1 means not capturing. */
-static int g_capture_tag = -1;
 
 extern "C" void backend_upload_tokens(const int *host_tokens, int S) {
     /* Copy tokens to the stable device buffer BEFORE stream capture begins,
@@ -763,14 +804,19 @@ extern "C" int backend_graph_replay(int tag, int T_enc, int S) {
 
 extern "C" void backend_graph_begin_capture(int tag) {
     g_capture_tag = tag;
-    CUDA_CHECK(cudaStreamBeginCapture(g_stream, cudaStreamCaptureModeGlobal));
+    CUDA_CHECK(cudaStreamBeginCapture(g_stream, cudaStreamCaptureModeThreadLocal));
 }
 
 extern "C" void backend_graph_end_capture(int tag, int T_enc, int S) {
     if (g_graph_cache_n >= GRAPH_CACHE_CAP) {
-        /* Cache full — end capture and discard; inference continues uncached. */
-        cudaGraph_t tmp;
+        /* Cache full: end capture, launch once (kernels did NOT run during capture),
+         * then destroy.  The result lands in the arena just like the cached path. */
+        cudaGraph_t tmp; cudaGraphExec_t exec;
         CUDA_CHECK(cudaStreamEndCapture(g_stream, &tmp));
+        CUDA_CHECK(cudaGraphInstantiate(&exec, tmp, NULL, NULL, 0));
+        CUDA_CHECK(cudaGraphLaunch(exec, g_stream));
+        CUDA_CHECK(cudaStreamSynchronize(g_stream));
+        cudaGraphExecDestroy(exec);
         cudaGraphDestroy(tmp);
         g_capture_tag = -1;
         return;
@@ -790,4 +836,145 @@ extern "C" void backend_graph_end_capture(int tag, int T_enc, int S) {
     CUDA_CHECK(cudaStreamSynchronize(g_stream));
 
     g_capture_tag = -1;
+}
+
+/* ============================================================ */
+/* Device-side sequence counter for single-graph decode          */
+/* ============================================================ */
+
+extern "C" void backend_decode_set_S(int n) {
+    /* Called from host outside any captured region. */
+    CUDA_CHECK(cudaMemcpyAsync(g_dev_S, &n, sizeof(int),
+                               cudaMemcpyHostToDevice, g_stream));
+    CUDA_CHECK(cudaStreamSynchronize(g_stream));
+}
+
+__global__ void inc_decode_S_k(int *S_ptr) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) atomicAdd(S_ptr, 1);
+}
+
+extern "C" void backend_decode_inc_S(void) {
+    inc_decode_S_k<<<1, 1, 0, g_stream>>>(g_dev_S);
+}
+
+/* Linear (T=1) → KV cache at slot (*g_dev_S - 1). */
+__global__ void linear_to_kvcache_k(float *cache, const float *x,
+                                     const __nv_bfloat16 *W, const __nv_bfloat16 *b,
+                                     const int *S_ptr, int in_d, int out_d) {
+    int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= out_d) return;
+    int slot = *S_ptr - 1;
+    float s = b ? __bfloat162float(b[o]) : 0.0f;
+    const __nv_bfloat16 *wr = W + (size_t)o * in_d;
+    for (int k = 0; k < in_d; k++) s += x[k] * __bfloat162float(wr[k]);
+    cache[(size_t)slot * out_d + o] = s;
+}
+
+extern "C" void backend_linear_to_kvcache(float *cache, const float *x,
+                                           const uint16_t *W, const uint16_t *b,
+                                           int in_d, int out_d) {
+    linear_to_kvcache_k<<<(out_d + 255)/256, 256, 0, g_stream>>>(
+        cache, x,
+        (const __nv_bfloat16 *)dev_w(W), (const __nv_bfloat16 *)dev_w(b),
+        g_dev_S, in_d, out_d);
+}
+
+/* SDP attention for T_q=1, T_k=*g_dev_S.
+ * Grid is over-provisioned to MAX_SEQ; inactive lanes self-terminate. */
+__global__ void sdp_score_decode_k(float *scores, const float *q, const float *k,
+                                    float scale, int h, int DK, int D,
+                                    const int *T_k_ptr) {
+    int ki = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ki >= *T_k_ptr) return;
+    float s = 0.0f;
+    for (int d = 0; d < DK; d++)
+        s += q[h*DK+d] * k[(size_t)ki*D + h*DK+d];
+    scores[ki] = s * scale;
+}
+
+/* Softmax in-place over scores[0..*T_k_ptr-1], 1 block / 256 threads. */
+__global__ void softmax_decode_k(float *scores, const int *T_k_ptr) {
+    int T_k = *T_k_ptr;
+    __shared__ float smem[33];
+
+    /* max */
+    float mx = -1e30f;
+    for (int i = threadIdx.x; i < T_k; i += blockDim.x)
+        mx = fmaxf(mx, scores[i]);
+    for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_down_sync(0xffffffff, mx, off));
+    if (threadIdx.x % 32 == 0) smem[threadIdx.x / 32] = mx;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m2 = smem[0];
+        int nw = (blockDim.x + 31) / 32;
+        for (int i = 1; i < nw; i++) m2 = fmaxf(m2, smem[i]);
+        smem[32] = m2;
+    }
+    __syncthreads();
+    mx = smem[32];
+
+    /* exp + sum */
+    float s = 0.0f;
+    for (int i = threadIdx.x; i < T_k; i += blockDim.x) {
+        scores[i] = expf(scores[i] - mx);
+        s += scores[i];
+    }
+    for (int off = 16; off > 0; off >>= 1) s += __shfl_down_sync(0xffffffff, s, off);
+    if (threadIdx.x % 32 == 0) smem[threadIdx.x / 32] = s;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float s2 = smem[0];
+        int nw = (blockDim.x + 31) / 32;
+        for (int i = 1; i < nw; i++) s2 += smem[i];
+        smem[32] = s2;
+    }
+    __syncthreads();
+    s = smem[32];
+    for (int i = threadIdx.x; i < T_k; i += blockDim.x) scores[i] /= s;
+}
+
+__global__ void sdp_aggregate_decode_k(float *out, const float *scores, const float *v,
+                                        int h, int DK, int D, const int *T_k_ptr) {
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= DK) return;
+    int T_k = *T_k_ptr;
+    float s = 0.0f;
+    for (int ki = 0; ki < T_k; ki++)
+        s += scores[ki] * v[(size_t)ki*D + h*DK+d];
+    out[h*DK+d] = s;
+}
+
+extern "C" void backend_sdp_attn_devS(float *out, const float *q,
+                                       const float *k, const float *v, float *work) {
+    float *scores = work;  /* MAX_SEQ floats */
+    const float scale = 1.0f / sqrtf((float)DEC_DK);
+    for (int h = 0; h < DEC_H; h++) {
+        sdp_score_decode_k<<<(MAX_SEQ + 255)/256, 256, 0, g_stream>>>(
+            scores, q, k, scale, h, DEC_DK, DEC_D, g_dev_S);
+        softmax_decode_k<<<1, 256, 0, g_stream>>>(scores, g_dev_S);
+        sdp_aggregate_decode_k<<<(DEC_DK + 31)/32, 32, 0, g_stream>>>(
+            out, scores, v, h, DEC_DK, DEC_D, g_dev_S);
+    }
+}
+
+/* Embed single token (from g_dev_tokens[0]) at position *g_dev_S - 1. */
+__global__ void embed_decode_k(float *h,
+                                const __nv_bfloat16 *etw, const __nv_bfloat16 *epw,
+                                int D, const int *tokens, const int *S_ptr) {
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= D) return;
+    int id  = tokens[0];
+    int pos = *S_ptr - 1;
+    h[d] = __bfloat162float(etw[(size_t)id*D + d])
+         + __bfloat162float(epw[(size_t)pos*D + d]);
+}
+
+extern "C" void backend_embed_decode(float *h,
+                                      const uint16_t *etw, const uint16_t *epw,
+                                      const uint16_t *elnw, const uint16_t *elnb) {
+    embed_decode_k<<<(DEC_D + 255)/256, 256, 0, g_stream>>>(
+        h,
+        (const __nv_bfloat16 *)dev_w(etw), (const __nv_bfloat16 *)dev_w(epw),
+        DEC_D, g_dev_tokens, g_dev_S);
+    backend_layernorm(h, h, elnw, elnb, 1, DEC_D);
 }

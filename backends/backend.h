@@ -19,6 +19,15 @@
 void  backend_init(int device_id);
 void  backend_destroy(void);
 
+/* Number of parallel execution units (GPUs for CUDA, CPU cores for CPU/IRON).
+ * run_chunks_parallel uses this to cap the thread count. */
+int   backend_num_devices(void);
+
+/* Release all CUDA resources owned by the calling thread (stream, arena,
+ * token buffer, graph cache).  No-op on CPU/IRON.  Must be called from each
+ * worker thread before it exits; backend_destroy() covers the main thread. */
+void  backend_thread_cleanup(void);
+
 /* Upload the entire safetensors data blob to device memory.
  * No-op on CPU.  Must be called before patch_weights_to_device(). */
 void  backend_weights_upload_blob(const void *host_base, size_t bytes);
@@ -79,8 +88,9 @@ void backend_sdp_attn(float *out, const float *q, const float *k, const float *v
                       const float *mask, int T_q, int T_k, float *work);
 
 /* Token embedding + positional embedding + layernorm → h (S, DEC_D).
+ * tokens[0..S-1] are embedded at absolute positions [pos_start..pos_start+S-1].
  * tokens is a host array; backend copies it to device if needed. */
-void backend_embed(float *h, const int *tokens, int S,
+void backend_embed(float *h, const int *tokens, int S, int pos_start,
                    const uint16_t *etw, const uint16_t *epw,
                    const uint16_t *elnw, const uint16_t *elnb);
 
@@ -123,5 +133,42 @@ void backend_graph_begin_capture(int tag);
  * launch it once so the first (recording) pass also produces results.
  * No-op on CPU/IRON. */
 void backend_graph_end_capture(int tag, int T_enc, int S);
+
+/* ============================================================ */
+/* Device-side sequence counter for single-graph decode          */
+/* ============================================================ */
+
+/* Set the device-side decode counter to n.  Call once before the decode
+ * loop, after the prefill step has populated the KV cache for n_prompt
+ * positions.  On CPU/IRON this is a plain thread-local write. */
+void backend_decode_set_S(int n);
+
+/* Increment the device-side counter by 1.  Must be the first kernel
+ * captured inside each decode graph, so all subsequent kernels see the
+ * updated value (*g_dev_S == new sequence length including this token). */
+void backend_decode_inc_S(void);
+
+/* Linear projection (T_q=1) that writes its output row into a KV cache
+ * buffer at the position indicated by the device-side counter:
+ *   cache[(*g_dev_S - 1) * out_d .. (*g_dev_S - 1) * out_d + out_d - 1]
+ * Equivalent to backend_linear with T=1 but avoids capturing a
+ * per-step host-computed pointer inside the graph. */
+void backend_linear_to_kvcache(float *cache, const float *x,
+                                const uint16_t *W, const uint16_t *b,
+                                int in_d, int out_d);
+
+/* Scaled dot-product attention for T_q=1, T_k=*g_dev_S, no mask.
+ * The grid is over-provisioned to MAX_SEQ; inactive lanes self-terminate.
+ * work must hold at least MAX_SEQ floats for the score buffer. */
+void backend_sdp_attn_devS(float *out, const float *q,
+                            const float *k, const float *v, float *work);
+
+/* Embed the single token staged in the backend token buffer at absolute
+ * position (*g_dev_S - 1), writing one DEC_D-wide row into h.
+ * The position is read from the device-side counter at kernel execution
+ * time, so one captured graph serves all decode steps. */
+void backend_embed_decode(float *h,
+                          const uint16_t *etw, const uint16_t *epw,
+                          const uint16_t *elnw, const uint16_t *elnb);
 
 #endif /* BACKENDS_BACKEND_H */

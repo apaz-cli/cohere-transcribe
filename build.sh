@@ -98,11 +98,12 @@ if [ "$HAS_IRON" -eq 1 ]; then
         "-lm -lpthread"
 fi
 
-# ---- Test: run whichever binary exists, prefer iron > cuda > cpu ----
+# ---- Test: run all binaries that were built ----
 AUDIO="${1:-test_files/start_the_game_already.mp3}"
 if [ -f "$AUDIO" ]; then
-    if   [ -f ./transcribe_iron ]; then ./transcribe_iron -v "$AUDIO"
-    elif [ -f ./transcribe_cuda ]; then ./transcribe_cuda -v "$AUDIO"
-    else                                ./transcribe      -v "$AUDIO"
-    fi
+    for bin in ./transcribe ./transcribe_cuda ./transcribe_iron; do
+        [ -f "$bin" ] || continue
+        echo "--- $bin ---"
+        "$bin" -v "$AUDIO"
+    done
 fi

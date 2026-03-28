@@ -26,7 +26,11 @@ void backend_destroy(void) {
     /* TODO: xrtDeviceClose() */
 }
 
-void backend_upload_tokens(const int *t, int S) { (void)t; (void)S; }
+void backend_thread_cleanup(void) {}
+int  backend_num_devices(void) { return 1; }
+
+static _Thread_local int g_iron_tokens[MAX_SEQ];
+void backend_upload_tokens(const int *t, int S) { memcpy(g_iron_tokens, t, (size_t)S * sizeof(int)); }
 int  backend_graph_replay(int tag, int T, int S) { (void)tag; (void)T; (void)S; return 0; }
 void backend_graph_begin_capture(int tag) { (void)tag; }
 void backend_graph_end_capture(int tag, int T, int S) { (void)tag; (void)T; (void)S; }
@@ -358,13 +362,13 @@ void backend_sdp_attn(float *out, const float *q, const float *k, const float *v
     }
 }
 
-void backend_embed(float *h, const int *tokens, int S,
+void backend_embed(float *h, const int *tokens, int S, int pos_start,
                    const uint16_t *etw, const uint16_t *epw,
                    const uint16_t *elnw, const uint16_t *elnb) {
     for (int t = 0; t < S; t++) {
         int id = tokens[t];
         for (int d = 0; d < DEC_D; d++)
-            h[t*DEC_D + d] = bf16(etw[id*DEC_D + d]) + bf16(epw[t*DEC_D + d]);
+            h[t*DEC_D + d] = bf16(etw[id*DEC_D + d]) + bf16(epw[(pos_start + t)*DEC_D + d]);
     }
     backend_layernorm(h, h, elnw, elnb, S, DEC_D);
 }
@@ -383,4 +387,32 @@ void backend_lm_head(float *logits_out, const float *last,
         for (int d = 0; d < DEC_D; d++) s += last[d] * bf16(wr[d]);
         logits_out[v] = s;
     }
+}
+
+static _Thread_local int g_iron_S = 0;
+
+void backend_decode_set_S(int n) { g_iron_S = n; }
+void backend_decode_inc_S(void)  { g_iron_S++; }
+
+void backend_linear_to_kvcache(float *cache, const float *x,
+                                const uint16_t *W, const uint16_t *b,
+                                int in_d, int out_d) {
+    float *dst = cache + (size_t)(g_iron_S - 1) * out_d;
+    for (int d = 0; d < out_d; d++) {
+        float acc = b ? bf16(b[d]) : 0.0f;
+        for (int i = 0; i < in_d; i++)
+            acc += x[i] * bf16(W[(size_t)d * in_d + i]);
+        dst[d] = acc;
+    }
+}
+
+void backend_sdp_attn_devS(float *out, const float *q,
+                            const float *k, const float *v, float *work) {
+    backend_sdp_attn(out, q, k, v, NULL, 1, g_iron_S, work);
+}
+
+void backend_embed_decode(float *h,
+                          const uint16_t *etw, const uint16_t *epw,
+                          const uint16_t *elnw, const uint16_t *elnb) {
+    backend_embed(h, g_iron_tokens, 1, g_iron_S - 1, etw, epw, elnw, elnb);
 }

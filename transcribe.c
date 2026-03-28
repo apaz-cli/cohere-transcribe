@@ -270,6 +270,7 @@ static void transcribe_chunk(const float *samples, int n_samples,
     const size_t n_cakv   = (size_t)DEC_N   * T_enc * DEC_D;
     const size_t n_hdec   = (size_t)MAX_SEQ * DEC_D;
     const size_t n_mask   = (size_t)MAX_SEQ * MAX_SEQ;
+    const size_t n_sakv   = (size_t)DEC_N   * MAX_SEQ * DEC_D;  /* per-layer SA KV cache */
 
     const size_t work_sub  = (size_t)SUB_CH * ((size_t)T1*F1 + (size_t)T2*F2);
     /* MHSA needs T×T + T×(2T-1) = T×(3T-1) floats for scores+scores_bd.
@@ -290,7 +291,7 @@ static void transcribe_chunk(const float *samples, int n_samples,
     if (work_dec  > work_size) work_size = work_dec;
 
     const size_t arena_floats = n_mel + n_xenc + n_posemb + n_ench
-                              + 2*n_cakv + n_hdec + n_mask + work_size;
+                              + 2*n_cakv + n_hdec + n_mask + 2*n_sakv + work_size;
 
     if (verbose) fprintf(stderr, "  chunk %.2fs: T_enc=%d arena=%.1fMB\n",
                          (float)n_samples / SR, T_enc,
@@ -309,6 +310,9 @@ static void transcribe_chunk(const float *samples, int n_samples,
     for (int l = 0; l < DEC_N; l++) { ca_v[l] = arena + off; off += (size_t)T_enc * DEC_D; }
     float *h_dec  = arena + off; off += n_hdec;
     float *mask   = arena + off; off += n_mask;
+    float *sa_k_cache[DEC_N], *sa_v_cache[DEC_N];
+    for (int l = 0; l < DEC_N; l++) { sa_k_cache[l] = arena + off; off += (size_t)MAX_SEQ * DEC_D; }
+    for (int l = 0; l < DEC_N; l++) { sa_v_cache[l] = arena + off; off += (size_t)MAX_SEQ * DEC_D; }
     float *work   = arena + off;
 
     /* Mel is computed on CPU; backend_htod uploads to arena (no-op on CPU). */
@@ -322,17 +326,48 @@ static void transcribe_chunk(const float *samples, int n_samples,
         free(work_cpu);
     }
     encoder_forward(mel, T_mel, x_enc, T_enc, pos_emb, enc_h, work);
-    precompute_ca_kv(enc_h, T_enc, ca_k, ca_v);
+    precompute_ca_kv(enc_h, T_mel, T_enc, ca_k, ca_v);
 
     int tokens[MAX_SEQ], S = 0;
     for (int i = 0; i < n_prompt; i++) tokens[S++] = prompt_ids[i];
     int prompt_end = S;
 
+    /* Initialise device-side counter so first decode step's backend_decode_inc_S()
+     * advances it to n_prompt+1 (the slot for the first generated token). */
+    backend_decode_set_S(S);
+
     for (int step = 0; step < MAX_SEQ - S; step++) {
-        int next_id = decoder_step(tokens, S, T_enc, ca_k, ca_v, h_dec, mask, work);
+        int next_id;
+        if (step == 0) {
+            /* Prefill: embed all prompt tokens, populate KV cache from scratch. */
+            next_id = decoder_step(tokens, S, S, T_mel, T_enc,
+                                   ca_k, ca_v, sa_k_cache, sa_v_cache,
+                                   h_dec, mask, work);
+        } else {
+            /* Decode: single-graph path keyed by (GRAPH_TAG_DECODER, T_mel, -1). */
+            next_id = decoder_step_decode(tokens[S-1], T_mel, T_enc,
+                                          ca_k, ca_v, sa_k_cache, sa_v_cache,
+                                          h_dec, work);
+        }
         tokens[S++] = next_id;
+        if (verbose && next_id >= 0 && next_id < vocab_size) {
+            const char *tok = vocab[next_id];
+            if (!(tok[0] == '<' && tok[1] == '|')) {
+                const char *p = tok;
+                while (*p) {
+                    if ((unsigned char)p[0]==0xE2 && (unsigned char)p[1]==0x96 && (unsigned char)p[2]==0x81) {
+                        fputc(' ', stderr);
+                        p += 3;
+                    } else {
+                        fputc(*p++, stderr);
+                    }
+                }
+                fflush(stderr);
+            }
+        }
         if (next_id == TOK_EOS) break;
     }
+    if (verbose) fputc('\n', stderr);
 
     print_tokens(tokens, prompt_end, S, out);
     if (n_tokens_out) *n_tokens_out = S - prompt_end;
@@ -446,8 +481,15 @@ typedef struct {
     pthread_mutex_t mu;
 } Queue;
 
-static void *worker(void *arg) {
-    Queue *q = arg;
+typedef struct {
+    Queue *q;
+    int    gpu_id;
+} WorkerArg;
+
+static void *worker(void *varg) {
+    WorkerArg *arg = (WorkerArg *)varg;
+    backend_init(arg->gpu_id);
+    Queue *q = arg->q;
     for (;;) {
         pthread_mutex_lock(&q->mu);
         int i = q->next++;
@@ -463,6 +505,7 @@ static void *worker(void *arg) {
         if (verbose) fprintf(stderr, "[%d/%d chunk=%.1fs tokens=%d]\n",
                              done, q->n_jobs, (float)w->n_samples / SR, w->n_tokens);
     }
+    backend_thread_cleanup();
     return NULL;
 }
 
@@ -487,16 +530,21 @@ static void run_chunks_parallel(const float *samples,
         start = end;
     }
 
-    long nthreads = sysconf(_SC_NPROCESSORS_ONLN);
+    int n_devices = backend_num_devices();
+    long nthreads = n_devices;
     if (nthreads < 1) nthreads = 1;
     if (nthreads > n_jobs) nthreads = n_jobs;
     if (verbose) fprintf(stderr, "  running %d chunks on %ld thread(s)\n", n_jobs, nthreads);
-    pthread_t *tids = calloc((size_t)nthreads, sizeof(pthread_t));
-    if (!tids) { fputs("OOM\n", stderr); exit(1); }
+    pthread_t  *tids = calloc((size_t)nthreads, sizeof(pthread_t));
+    WorkerArg  *args = calloc((size_t)nthreads, sizeof(WorkerArg));
+    if (!tids || !args) { fputs("OOM\n", stderr); exit(1); }
 
     Queue q = { jobs, n_jobs, 0, 0, PTHREAD_MUTEX_INITIALIZER };
-    for (int i = 0; i < (int)nthreads; i++)
-        pthread_create(&tids[i], NULL, worker, &q);
+    for (int i = 0; i < (int)nthreads; i++) {
+        args[i].q      = &q;
+        args[i].gpu_id = i % n_devices;
+        pthread_create(&tids[i], NULL, worker, &args[i]);
+    }
     for (int i = 0; i < (int)nthreads; i++)
         pthread_join(tids[i], NULL);
 
@@ -506,6 +554,7 @@ static void run_chunks_parallel(const float *samples,
     }
 
     pthread_mutex_destroy(&q.mu);
+    free(args);
     free(tids);
     free(jobs);
 }
@@ -581,11 +630,10 @@ int main(int argc, char **argv) {
 
     if (verbose) fprintf(stderr, "Loading model weights ...\n");
     load_weights();
-    backend_init(0);
 #if defined(BACKEND_CUDA) && !defined(EMBEDDED_MODEL)
     backend_weights_upload_blob(sf_data, sf_data_bytes);
-    patch_weights_to_device();
 #endif
+    backend_init(0);
 
     int n_samples;
     if (verbose) fprintf(stderr, "Loading %s ...\n", audio_file);
