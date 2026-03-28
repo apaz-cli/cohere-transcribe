@@ -14,6 +14,9 @@ test_files/jeff.en.vtt
 test_files/jeff_cpu.txt
 test_files/jeff_gpu.txt
 test_files/jeff_iron.txt
+test_files/jeff_batched_cpu.txt
+test_files/jeff_batched_gpu.txt
+test_files/jeff_batched_iron.txt
 
 tests/*.bin
 tests/compare_floats

@@ -324,10 +324,10 @@ static void encoder_forward(const float *mel, int T_mel,
      * produce the same T_enc through the ceiling-division subsampling chain,
      * so keying by T_enc would replay a graph with stale T_mel-dependent grid
      * sizes (transpose_mel, conv2d launches) on mismatched mel data. */
-    if (!backend_graph_replay(GRAPH_TAG_ENCODER, T_mel, 0)) {
+    if (!backend_graph_replay(GRAPH_TAG_ENCODER, T_mel, 0, 1)) {
         backend_graph_begin_capture(GRAPH_TAG_ENCODER);
 
-        backend_encoder_subsampling(mel, T_mel, x_enc, T_enc, work, &W);
+        backend_encoder_subsampling(mel, T_mel, T_mel, x_enc, T_enc, work, &W);
         backend_make_rel_pos_emb(pos_emb, T_enc);
 
         for (int l = 0; l < ENC_N; l++) {
@@ -339,7 +339,7 @@ static void encoder_forward(const float *mel, int T_mel,
 
         backend_linear(enc_h, x_enc, W.prw, W.prb, T_enc, ENC_D, DEC_D);
 
-        backend_graph_end_capture(GRAPH_TAG_ENCODER, T_mel, 0);
+        backend_graph_end_capture(GRAPH_TAG_ENCODER, T_mel, 0, 1);
     }
 }
 
@@ -351,7 +351,7 @@ static void precompute_ca_kv(const float *enc_h, int T_mel, int T_enc,
     /* Key by T_mel: ca_k/ca_v live at T_mel-dependent arena offsets, so two
      * chunks sharing T_enc but differing in T_mel would otherwise replay a
      * graph whose captured ca_k/ca_v point into the wrong arena region. */
-    if (!backend_graph_replay(GRAPH_TAG_PRECOMPUTE, T_mel, 0)) {
+    if (!backend_graph_replay(GRAPH_TAG_PRECOMPUTE, T_mel, 0, 1)) {
         backend_graph_begin_capture(GRAPH_TAG_PRECOMPUTE);
 
         for (int l = 0; l < DEC_N; l++) {
@@ -359,7 +359,7 @@ static void precompute_ca_kv(const float *enc_h, int T_mel, int T_enc,
             backend_linear(ca_v[l], enc_h, W.dec[l].ca_vw, W.dec[l].ca_vb, T_enc, DEC_D, DEC_D);
         }
 
-        backend_graph_end_capture(GRAPH_TAG_PRECOMPUTE, T_mel, 0);
+        backend_graph_end_capture(GRAPH_TAG_PRECOMPUTE, T_mel, 0, 1);
     }
 }
 
@@ -471,7 +471,7 @@ static int decoder_step(const int *tokens, int S, int S_q, int T_mel, int T_enc,
      * T_mel-dependent arena offsets, so two chunks sharing T_enc but differing
      * in T_mel would otherwise replay a graph whose captured pointers point
      * into the wrong arena region. */
-    if (!backend_graph_replay(GRAPH_TAG_DECODER, T_mel, S)) {
+    if (!backend_graph_replay(GRAPH_TAG_DECODER, T_mel, S, 1)) {
         backend_graph_begin_capture(GRAPH_TAG_DECODER);
 
         /* Embed S_q tokens at absolute positions [S-S_q .. S-1]. */
@@ -489,7 +489,7 @@ static int decoder_step(const int *tokens, int S, int S_q, int T_mel, int T_enc,
         backend_layernorm(h, h, W.dlnw, W.dlnb, S_q, DEC_D);
         backend_lm_head(dev_logits, h + (size_t)(S_q - 1) * DEC_D, W.etw, W.hdb);
 
-        backend_graph_end_capture(GRAPH_TAG_DECODER, T_mel, S);
+        backend_graph_end_capture(GRAPH_TAG_DECODER, T_mel, S, 1);
     }
 
     /* DtoH and argmax are always outside the captured region. */
@@ -526,7 +526,7 @@ static int decoder_step_decode(int next_token, int T_mel, int T_enc,
 
     /* Sentinel S=-1 never collides with prefill key (S=n_prompt≥1) or old
      * per-step decode keys (S≥2). */
-    if (!backend_graph_replay(GRAPH_TAG_DECODER, T_mel, -1)) {
+    if (!backend_graph_replay(GRAPH_TAG_DECODER, T_mel, -1, 1)) {
         backend_graph_begin_capture(GRAPH_TAG_DECODER);
 
         /* Increment must be the first captured kernel so all subsequent
@@ -541,7 +541,7 @@ static int decoder_step_decode(int next_token, int T_mel, int T_enc,
         backend_layernorm(h, h, W.dlnw, W.dlnb, 1, DEC_D);
         backend_lm_head(dev_logits, h, W.etw, W.hdb);
 
-        backend_graph_end_capture(GRAPH_TAG_DECODER, T_mel, -1);
+        backend_graph_end_capture(GRAPH_TAG_DECODER, T_mel, -1, 1);
     }
 
     float logits_cpu[VOCAB];
@@ -551,6 +551,196 @@ static int decoder_step_decode(int next_token, int T_mel, int T_enc,
     for (int v = 1; v < VOCAB; v++)
         if (logits_cpu[v] > best) { best = logits_cpu[v]; best_id = v; }
     return best_id;
+}
+
+/* ============================================================
+ * Batch encoder forward: runs the encoder on B zero-padded mel spectrograms.
+ *
+ * mel_batch:   [B, N_MELS, T_mel_max]  — all items zero-padded to T_mel_max
+ * T_mel_max:   padded mel length (buffer stride for subsampling reads)
+ * T_enc[b]:    actual valid encoder length for item b
+ * T_enc_max:   max of T_enc[], used for pos_emb allocation
+ * x_enc_batch: [B, T_enc_max, ENC_D]  — encoder outputs (out)
+ * pos_emb:     [2*T_enc_max-1, ENC_D] — sinusoidal embeddings (written once)
+ * enc_h_batch: [B, T_enc_max, DEC_D]  — post-projection encoder hidden (out)
+ *
+ * Each item b is processed with its actual T_enc[b] positions, using an offset
+ * into the shared pos_emb so that relative position embeddings are bit-identical
+ * to the single-item path.  The subsampling still reads with stride T_mel_max
+ * (correct for the zero-padded batch buffer), but the conformer and projection
+ * only touch the first T_enc[b] rows — giving results identical to B=1.
+ * ============================================================ */
+static void encoder_forward_batch(const float *mel_batch, int B,
+                                   int T_mel_max, const int *T_mel,
+                                   const int *T_enc, int T_enc_max,
+                                   float *x_enc_batch, float *pos_emb,
+                                   float *enc_h_batch, float *work) {
+    extern int verbose;
+    /* pos_emb built for T_enc_max: pos_emb[i] = embedding for relative position
+     * i - (T_enc_max-1).  For item b with T_enc[b] <= T_enc_max, the conformer
+     * with sequence length T_enc[b] needs embeddings for relative positions
+     * -(T_enc[b]-1)..+(T_enc[b]-1), which live at indices
+     * (T_enc_max-T_enc[b])..(T_enc_max+T_enc[b]-2) in pos_emb.
+     * Passing pos_emb + (T_enc_max-T_enc[b])*ENC_D makes index 0 of the shifted
+     * pointer correspond to relative position -(T_enc[b]-1), matching B=1. */
+    backend_make_rel_pos_emb(pos_emb, T_enc_max);
+    for (int b = 0; b < B; b++) {
+        const float *mel_b     = mel_batch   + (size_t)b * N_MELS    * T_mel_max;
+        float       *x_enc_b   = x_enc_batch + (size_t)b * T_enc_max * ENC_D;
+        float       *enc_h_b   = enc_h_batch + (size_t)b * T_enc_max * DEC_D;
+        int          Te        = T_enc[b];
+        const float *pos_emb_b = pos_emb + (size_t)(T_enc_max - Te) * ENC_D;
+
+        /* Subsampling uses T_mel[b] as the actual length and T_mel_max as the
+         * row stride (the mel is zero-padded to T_mel_max columns in mel_batch).
+         * Passing T_mel[b] ensures conv2d sees the correct input size, giving
+         * bit-identical encoder output to the single-item path. */
+        backend_encoder_subsampling(mel_b, T_mel[b], T_mel_max, x_enc_b, Te, work, &W);
+        for (int l = 0; l < ENC_N; l++) {
+            /* Process only the Te valid rows; pos_emb_b is shifted so that relative
+             * position indices match the B=1 path exactly. */
+            conformer_layer(x_enc_b, pos_emb_b, Te, &W.enc[l], work);
+#if !defined(BACKEND_CUDA) && !defined(BACKEND_IRON)
+            if (verbose) fprintf(stderr, "  batch item %d layer %d/%d\n", b, l+1, ENC_N);
+#endif
+        }
+        backend_linear(enc_h_b, x_enc_b, W.prw, W.prb, Te, ENC_D, DEC_D);
+    }
+}
+
+/* ============================================================
+ * Batch cross-attention K/V precompute.
+ *
+ * enc_h_batch: [B, T_enc_max, DEC_D]
+ * T_enc[b]:    actual valid encoder length for item b (rows beyond T_enc[b]
+ *              in enc_h_batch[b] are near-zero from padding and ignored)
+ * ca_k_batch[l]: [B, T_enc_max, DEC_D] — only first T_enc[b] rows written
+ * ca_v_batch[l]: [B, T_enc_max, DEC_D] — only first T_enc[b] rows written
+ * ============================================================ */
+static void precompute_ca_kv_batch(const float *enc_h_batch, int B,
+                                    const int *T_enc, int T_enc_max,
+                                    float *ca_k_batch[DEC_N],
+                                    float *ca_v_batch[DEC_N]) {
+    for (int b = 0; b < B; b++) {
+        const float *enc_h_b = enc_h_batch + b * (size_t)T_enc_max * DEC_D;
+        for (int l = 0; l < DEC_N; l++) {
+            float *ca_k_b = ca_k_batch[l] + b * (size_t)T_enc_max * DEC_D;
+            float *ca_v_b = ca_v_batch[l] + b * (size_t)T_enc_max * DEC_D;
+            backend_linear(ca_k_b, enc_h_b, W.dec[l].ca_kw, W.dec[l].ca_kb,
+                           T_enc[b], DEC_D, DEC_D);
+            backend_linear(ca_v_b, enc_h_b, W.dec[l].ca_vw, W.dec[l].ca_vb,
+                           T_enc[b], DEC_D, DEC_D);
+        }
+    }
+}
+
+/* ============================================================
+ * Batch decoder layer — decode step (T_q=1 per active item).
+ *
+ * h_dec:        [B, DEC_D]          — hidden state, updated in-place
+ * ca_k_batch_l: [B, T_enc_max, DEC_D] — cross-attn keys for this layer
+ * ca_v_batch_l: [B, T_enc_max, DEC_D] — cross-attn values for this layer
+ * T_enc[b]:     actual cross-attn length per item
+ * sa_k/v_batch: [B, MAX_SEQ, DEC_D] — self-attn KV cache for this layer
+ * S_dev[b]:     current sequence length (already incremented; KV written to
+ *               slot S_dev[b]-1, attention over S_dev[b] entries)
+ * active[b]:    1 = process, 0 = skip
+ * work:         scratch, sized for a single item's decode step
+ * ============================================================ */
+/* decoder_layer_decode_batch: one decode step for B sequences in parallel.
+ *
+ * All B items are processed together using batched backend calls.  Inactive
+ * items produce garbage outputs that are discarded by the caller (lm_head_batch
+ * and argmax_batch both check active[] before writing results).
+ *
+ * Work layout (from work pointer):
+ *   [B, DEC_D]   ln       — layernorm scratch
+ *   [B, DEC_D]   Q        — query projections
+ *   [B, DEC_D]   attn_out — attention output accumulator
+ *   [B * DEC_H * max(MAX_SEQ, T_enc_max)]  sdp_work — attention scores
+ *
+ * Device-side S counter array (g_dev_S_batch) must have been set by the
+ * preceding backend_embed_decode_batch call this step.
+ * Device-side T_enc array (g_dev_T_enc) must have been set once before the
+ * decode loop via backend_upload_T_enc. */
+static void decoder_layer_decode_batch(
+        float *h_dec,
+        const float *ca_k_batch_l, const float *ca_v_batch_l,
+        int T_enc_max,
+        float *sa_k_batch_l, float *sa_v_batch_l,
+        int B, const DLayer *L, float *work) {
+    float *ln       = work;
+    float *Q        = work + (size_t)B * DEC_D;
+    float *attn_out = work + (size_t)2 * B * DEC_D;
+    float *sdp_work = work + (size_t)3 * B * DEC_D;
+
+    /* Self-attention: process all B items in one set of batched calls. */
+    backend_layernorm(ln, h_dec, L->sa_lnw, L->sa_lnb, B, DEC_D);
+    backend_linear(Q, ln, L->sa_qw, L->sa_qb, B, DEC_D, DEC_D);
+    backend_linear_to_kvcache_batch(sa_k_batch_l, ln, L->sa_kw, L->sa_kb,
+                                     B, MAX_SEQ, DEC_D, DEC_D);
+    backend_linear_to_kvcache_batch(sa_v_batch_l, ln, L->sa_vw, L->sa_vb,
+                                     B, MAX_SEQ, DEC_D, DEC_D);
+    backend_sdp_attn_batch_decode_sa(attn_out, Q,
+                                      sa_k_batch_l, sa_v_batch_l,
+                                      MAX_SEQ, B, sdp_work);
+    backend_linear_fmadd(h_dec, 1.0f, attn_out, L->sa_ow, L->sa_ob, B, DEC_D, DEC_D);
+
+    /* Cross-attention: T_k[b] = T_enc[b] from device state. */
+    backend_layernorm(ln, h_dec, L->ca_lnw, L->ca_lnb, B, DEC_D);
+    backend_linear(Q, ln, L->ca_qw, L->ca_qb, B, DEC_D, DEC_D);
+    backend_sdp_attn_batch_decode_ca(attn_out, Q,
+                                      ca_k_batch_l, ca_v_batch_l,
+                                      T_enc_max, B, sdp_work);
+    backend_linear_fmadd(h_dec, 1.0f, attn_out, L->ca_ow, L->ca_ob, B, DEC_D, DEC_D);
+
+    /* FFN */
+    float *mid = Q;
+    backend_layernorm(ln, h_dec, L->ffn_lnw, L->ffn_lnb, B, DEC_D);
+    backend_linear_relu(mid, ln, L->ffn_w1, L->ffn_b1, B, DEC_D, DEC_FF);
+    backend_linear_fmadd(h_dec, 1.0f, mid, L->ffn_w2, L->ffn_b2, B, DEC_FF, DEC_D);
+}
+
+/* ============================================================
+ * Batch decoder decode step: one autoregressive step for B sequences.
+ *
+ * tokens_cur[b]: token to embed in this step (= tokens[b][S[b]-1], before
+ *                S was incremented). Active items only; inactive ignored.
+ * S_dev[b]:      sequence counter AFTER increment (S_dev[b] was incremented
+ *                by the caller before this call, same semantics as g_dev_S).
+ * active[b]:     1 = active, 0 = already finished.
+ * T_enc[b]:      actual encoder output length per item.
+ * T_enc_max:     stride of ca_k/ca_v/sa_k/sa_v batch buffers.
+ * ca_k/v_batch[l]: [B, T_enc_max, DEC_D] per decoder layer l.
+ * sa_k/v_batch[l]: [B, MAX_SEQ, DEC_D]  per decoder layer l.
+ * h_dec:         [B, DEC_D] scratch for current hidden states (out).
+ * logits_batch:  [B, VOCAB] scratch for logits.
+ * work:          scratch sized for one item's decode step.
+ * next_tokens[b]: output — argmax token for each active item.
+ * ============================================================ */
+static void decoder_step_decode_batch(
+        const int *tokens_cur, const int *S_dev, const int *active,
+        int T_enc_max,
+        float *ca_k_batch[DEC_N], float *ca_v_batch[DEC_N],
+        float *sa_k_batch[DEC_N], float *sa_v_batch[DEC_N],
+        float *h_dec, float *logits_batch, float *work, int B,
+        int *next_tokens) {
+    /* Embed current tokens (also uploads S_dev to device for kvcache/sdp use). */
+    backend_embed_decode_batch(h_dec, tokens_cur, S_dev, active, B,
+                                W.etw, W.epw, W.elnw, W.elnb);
+
+    /* Decoder layers: all B items processed in parallel per layer. */
+    for (int l = 0; l < DEC_N; l++)
+        decoder_layer_decode_batch(h_dec,
+                                    ca_k_batch[l], ca_v_batch[l],
+                                    T_enc_max,
+                                    sa_k_batch[l], sa_v_batch[l],
+                                    B, &W.dec[l], work);
+
+    /* Final layernorm for all B (inactive items produce garbage, discarded below). */
+    backend_layernorm(h_dec, h_dec, W.dlnw, W.dlnb, B, DEC_D);
+    backend_lm_head_batch(logits_batch, h_dec, W.etw, W.hdb, active, B);
+    backend_argmax_batch(next_tokens, logits_batch, active, B);
 }
 
 #endif /* MODEL_H */

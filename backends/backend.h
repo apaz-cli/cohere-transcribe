@@ -65,8 +65,10 @@ void backend_linear_fmadd(float *acc, float scale, const float *x,
 /* Element-wise residual add: dst[i] += src[i] */
 void backend_add_inplace(float *dst, const float *src, int n);
 
-/* Encoder subsampling: mel (N_MELS, T_mel) → x_enc (T_enc, ENC_D). */
-void backend_encoder_subsampling(const float *mel, int T_mel,
+/* Encoder subsampling: mel (N_MELS, T_mel) → x_enc (T_enc, ENC_D).
+ * T_mel_stride is the distance between mel rows in memory (== T_mel for
+ * single-item; == T_mel_max for items packed in a zero-padded batch buffer). */
+void backend_encoder_subsampling(const float *mel, int T_mel, int T_mel_stride,
                                   float *x_enc, int T_enc, float *work,
                                   const Weights *W);
 
@@ -117,22 +119,22 @@ void backend_lm_head(float *logits_out, const float *last,
  * No-op on CPU/IRON (tokens are already host-accessible). */
 void backend_upload_tokens(const int *host_tokens, int S);
 
-/* Look up a cached graph by (tag, T_enc, S).
+/* Look up a cached graph by (tag, T_enc, S, B).
  * CUDA: if found, launches the graph on g_stream and returns 1.
  *       Returns 0 if not found — caller must run kernels and record them
  *       with backend_graph_begin_capture / backend_graph_end_capture.
  * CPU/IRON: always returns 0. */
-int  backend_graph_replay(int tag, int T_enc, int S);
+int  backend_graph_replay(int tag, int T_enc, int S, int B);
 
 /* Begin stream capture.  Subsequent backend_* kernel calls are recorded but
  * not executed until backend_graph_end_capture launches the graph.
  * No-op on CPU/IRON. */
 void backend_graph_begin_capture(int tag);
 
-/* End capture, instantiate the graph, cache it under (tag, T_enc, S), and
+/* End capture, instantiate the graph, cache it under (tag, T_enc, S, B), and
  * launch it once so the first (recording) pass also produces results.
  * No-op on CPU/IRON. */
-void backend_graph_end_capture(int tag, int T_enc, int S);
+void backend_graph_end_capture(int tag, int T_enc, int S, int B);
 
 /* ============================================================ */
 /* Device-side sequence counter for single-graph decode          */
@@ -170,5 +172,58 @@ void backend_sdp_attn_devS(float *out, const float *q,
 void backend_embed_decode(float *h,
                           const uint16_t *etw, const uint16_t *epw,
                           const uint16_t *elnw, const uint16_t *elnb);
+
+/* ============================================================ */
+/* Batched decode-step helpers (used by decoder_step_decode_batch) */
+/* ============================================================ */
+
+/* For each active item b: embed tokens[b] at position S_dev[b]-1 into h[b*DEC_D].
+ * tokens is a host array of B current tokens (one per batch item).
+ * S_dev[b] is the device-side sequence counter (already incremented for this step).
+ * Inactive items (active[b]==0) are skipped; their h row is left unchanged. */
+void backend_embed_decode_batch(float *h, const int *tokens,
+                                 const int *S_dev, const int *active, int B,
+                                 const uint16_t *etw, const uint16_t *epw,
+                                 const uint16_t *elnw, const uint16_t *elnb);
+
+/* LM head for B items.  For each active b: writes VOCAB logits to
+ * logits[b*VOCAB..] from last hidden h[b*DEC_D..].  Inactive items skipped. */
+void backend_lm_head_batch(float *logits, const float *h,
+                            const uint16_t *etw, const uint16_t *hdb,
+                            const int *active, int B);
+
+/* Argmax over VOCAB for each active item b; writes best token id to out[b].
+ * Inactive items: out[b] is left unchanged by the caller. */
+void backend_argmax_batch(int *out, const float *logits,
+                           const int *active, int B);
+
+/* ============================================================ */
+/* Batched decode helpers for parallel B-item decoder steps     */
+/* ============================================================ */
+
+/* Upload T_enc[B] to the backend's per-item device state.
+ * Call once before the batch decode loop; stays valid for the whole loop. */
+void backend_upload_T_enc(const int *T_enc, int B);
+
+/* Batched KV-cache linear projection for B decode-step items.
+ * x:     [B, in_d]                              — input (one query row per item)
+ * cache: [B, cache_seq_stride, out_d]           — KV cache, pre-allocated
+ * Writes into cache[b, S_dev[b]-1, :] for each b, where S_dev comes from the
+ * state set by the most recent backend_embed_decode_batch call. */
+void backend_linear_to_kvcache_batch(float *cache, const float *x,
+                                      const uint16_t *W, const uint16_t *b,
+                                      int B, int cache_seq_stride,
+                                      int in_d, int out_d);
+
+/* Batched SDP attention for B items, T_q=1 per item.
+ * Q:   [B, DEC_D], K/V: [B, T_k_stride, DEC_D], out: [B, DEC_D]
+ * _sa: T_k[b] comes from the S counter set by backend_embed_decode_batch.
+ * _ca: T_k[b] comes from the T_enc array set by backend_upload_T_enc. */
+void backend_sdp_attn_batch_decode_sa(float *out, const float *Q,
+                                       const float *K, const float *V,
+                                       int T_k_stride, int B, float *work);
+void backend_sdp_attn_batch_decode_ca(float *out, const float *Q,
+                                       const float *K, const float *V,
+                                       int T_k_stride, int B, float *work);
 
 #endif /* BACKENDS_BACKEND_H */

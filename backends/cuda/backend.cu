@@ -48,7 +48,13 @@ static thread_local float        *g_arena         = NULL;
 static thread_local size_t        g_arena_bytes    = 0;
 static thread_local int          *g_dev_tokens     = NULL;
 static thread_local int          *g_dev_S          = NULL;  /* device-side sequence counter */
+static thread_local int          *g_dev_active     = NULL;  /* batch active flags [MAX_BATCH] */
+static thread_local int          *g_dev_S_batch    = NULL;  /* batch S counters  [MAX_BATCH] */
+static thread_local int          *g_dev_cur_tokens = NULL;  /* batch current tokens [MAX_BATCH] */
+static thread_local int          *g_dev_T_enc      = NULL;  /* per-item encoder lengths [MAX_BATCH] */
 static thread_local int           g_device_id      = -1;
+
+#define MAX_BATCH 256
 static thread_local int           g_capture_tag    = -1;
 
 /* ---- Graph cache (per-thread) ---- */
@@ -58,6 +64,7 @@ typedef struct {
     int              tag;
     int              T_enc;
     int              S;
+    int              B;
     void            *arena_base;  /* g_arena value at capture time */
     cudaGraph_t      graph;
     cudaGraphExec_t  exec;
@@ -74,10 +81,10 @@ static void graph_invalidate_all(void) {
     g_graph_cache_n = 0;
 }
 
-static GraphEntry *graph_find(int tag, int T_enc, int S) {
+static GraphEntry *graph_find(int tag, int T_enc, int S, int B) {
     for (int i = 0; i < g_graph_cache_n; i++) {
         GraphEntry *e = &g_graph_cache[i];
-        if (e->tag == tag && e->T_enc == T_enc && e->S == S
+        if (e->tag == tag && e->T_enc == T_enc && e->S == S && e->B == B
                           && e->arena_base == (void *)g_arena)
             return e;
     }
@@ -103,18 +110,26 @@ extern "C" void backend_init(int device_id) {
     g_device_id = device_id;
     CUDA_CHECK(cudaSetDevice(device_id));
     CUDA_CHECK(cudaStreamCreate(&g_stream));
-    CUDA_CHECK(cudaMalloc(&g_dev_tokens, MAX_SEQ * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&g_dev_S, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&g_dev_tokens,     MAX_SEQ   * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&g_dev_S,          sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&g_dev_active,     MAX_BATCH * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&g_dev_S_batch,    MAX_BATCH * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&g_dev_cur_tokens, MAX_BATCH * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&g_dev_T_enc,      MAX_BATCH * sizeof(int)));
 }
 
 extern "C" void backend_thread_cleanup(void) {
     if (g_device_id < 0) return;
     CUDA_CHECK(cudaSetDevice(g_device_id));
     graph_invalidate_all();
-    if (g_arena)      { CUDA_CHECK(cudaFree(g_arena));      g_arena = NULL; g_arena_bytes = 0; }
-    if (g_dev_tokens) { CUDA_CHECK(cudaFree(g_dev_tokens)); g_dev_tokens = NULL; }
-    if (g_dev_S)      { CUDA_CHECK(cudaFree(g_dev_S));      g_dev_S = NULL; }
-    if (g_stream)     { CUDA_CHECK(cudaStreamDestroy(g_stream)); g_stream = NULL; }
+    if (g_arena)          { CUDA_CHECK(cudaFree(g_arena));          g_arena = NULL; g_arena_bytes = 0; }
+    if (g_dev_tokens)     { CUDA_CHECK(cudaFree(g_dev_tokens));     g_dev_tokens = NULL; }
+    if (g_dev_S)          { CUDA_CHECK(cudaFree(g_dev_S));          g_dev_S = NULL; }
+    if (g_dev_active)     { CUDA_CHECK(cudaFree(g_dev_active));     g_dev_active = NULL; }
+    if (g_dev_S_batch)    { CUDA_CHECK(cudaFree(g_dev_S_batch));    g_dev_S_batch = NULL; }
+    if (g_dev_cur_tokens) { CUDA_CHECK(cudaFree(g_dev_cur_tokens)); g_dev_cur_tokens = NULL; }
+    if (g_dev_T_enc)      { CUDA_CHECK(cudaFree(g_dev_T_enc));      g_dev_T_enc = NULL; }
+    if (g_stream)         { CUDA_CHECK(cudaStreamDestroy(g_stream)); g_stream = NULL; }
     g_device_id = -1;
 }
 
@@ -149,11 +164,13 @@ extern "C" void *backend_device_ptr(const void *host_ptr) {
 
 extern "C" float *backend_arena_alloc(size_t floats) {
     size_t need = floats * sizeof(float);
+    /* Always invalidate cached graphs on a new allocation: stale graphs from a
+     * previous chunk/batch capture pointers into old arena regions that would
+     * be wrong for the new arena layout (even if the base pointer is unchanged
+     * because the arena was reused at the same address). */
+    if (g_arena) graph_invalidate_all();
     if (need > g_arena_bytes) {
-        if (g_arena) {
-            graph_invalidate_all();
-            CUDA_CHECK(cudaFree(g_arena));
-        }
+        if (g_arena) CUDA_CHECK(cudaFree(g_arena));
         CUDA_CHECK(cudaMalloc(&g_arena, need));
         g_arena_bytes = need;
     }
@@ -549,10 +566,11 @@ extern "C" void backend_conformer_conv(float *x, int T, const ELayer *L, float *
 /* Encoder subsampling                                           */
 /* ============================================================ */
 
-__global__ void transpose_mel_k(float *out, const float *in, int T_mel, int M) {
+__global__ void transpose_mel_k(float *out, const float *in,
+                                int T_mel, int T_mel_stride, int M) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     int m = blockIdx.y * blockDim.y + threadIdx.y;
-    if (t < T_mel && m < M) out[(size_t)t*M + m] = in[(size_t)m*T_mel + t];
+    if (t < T_mel && m < M) out[(size_t)t*M + m] = in[(size_t)m*T_mel_stride + t];
 }
 
 __global__ void conv2d_k(float *out, const float *in, const __nv_bfloat16 *Wf, const __nv_bfloat16 *bf,
@@ -611,7 +629,7 @@ __global__ void flatten_sub_k(float *out, const float *in, int T_enc, int CH, in
         out[(size_t)t*(CH*F) + ch*F + f] = in[(size_t)ch*(T_enc*F) + t*F + f];
 }
 
-extern "C" void backend_encoder_subsampling(const float *mel, int T_mel,
+extern "C" void backend_encoder_subsampling(const float *mel, int T_mel, int T_mel_stride,
                                              float *x_enc, int T_enc, float *work,
                                              const Weights *W) {
     const int T1 = (T_mel+1)/2, T2 = (T1+1)/2;
@@ -624,10 +642,12 @@ extern "C" void backend_encoder_subsampling(const float *mel, int T_mel,
     float *buf0  = work;
     float *mel_t = work + B0;
 
-    /* Transpose mel (N_MELS, T_mel) → (T_mel, N_MELS) */
+    /* Transpose mel (N_MELS, T_mel_stride) → (T_mel, N_MELS).
+     * Use T_mel_stride as the row stride when reading mel, but only
+     * transpose T_mel columns so conv2d sees the correct input length. */
     {
         dim3 block(16, 16), grid((T_mel+15)/16, (N_MELS+15)/16);
-        transpose_mel_k<<<grid, block, 0, g_stream>>>(mel_t, mel, T_mel, N_MELS);
+        transpose_mel_k<<<grid, block, 0, g_stream>>>(mel_t, mel, T_mel, T_mel_stride, N_MELS);
     }
 
     launch_conv2d(buf0, mel_t, W->s0w, W->s0b, 1, T_mel, N_MELS, SUB_CH, 3,3,2,1,1);
@@ -794,8 +814,8 @@ extern "C" void backend_upload_tokens(const int *host_tokens, int S) {
     CUDA_CHECK(cudaStreamSynchronize(g_stream));
 }
 
-extern "C" int backend_graph_replay(int tag, int T_enc, int S) {
-    GraphEntry *e = graph_find(tag, T_enc, S);
+extern "C" int backend_graph_replay(int tag, int T_enc, int S, int B) {
+    GraphEntry *e = graph_find(tag, T_enc, S, B);
     if (!e) return 0;
     CUDA_CHECK(cudaGraphLaunch(e->exec, g_stream));
     CUDA_CHECK(cudaStreamSynchronize(g_stream));
@@ -807,7 +827,7 @@ extern "C" void backend_graph_begin_capture(int tag) {
     CUDA_CHECK(cudaStreamBeginCapture(g_stream, cudaStreamCaptureModeThreadLocal));
 }
 
-extern "C" void backend_graph_end_capture(int tag, int T_enc, int S) {
+extern "C" void backend_graph_end_capture(int tag, int T_enc, int S, int B) {
     if (g_graph_cache_n >= GRAPH_CACHE_CAP) {
         /* Cache full: end capture, launch once (kernels did NOT run during capture),
          * then destroy.  The result lands in the arena just like the cached path. */
@@ -826,6 +846,7 @@ extern "C" void backend_graph_end_capture(int tag, int T_enc, int S) {
     e->tag        = tag;
     e->T_enc      = T_enc;
     e->S          = S;
+    e->B          = B;
     e->arena_base = (void *)g_arena;
 
     CUDA_CHECK(cudaStreamEndCapture(g_stream, &e->graph));
@@ -977,4 +998,245 @@ extern "C" void backend_embed_decode(float *h,
         (const __nv_bfloat16 *)dev_w(etw), (const __nv_bfloat16 *)dev_w(epw),
         DEC_D, g_dev_tokens, g_dev_S);
     backend_layernorm(h, h, elnw, elnb, 1, DEC_D);
+}
+
+/* ============================================================ */
+/* Batched decode-step helpers                                   */
+/* ============================================================ */
+
+/* Kernel: embed token tokens_dev[b] at position S_dev[b]-1 into h[b*DEC_D].
+ * Each block handles one (b, d) pair; inactive items are skipped. */
+__global__ void embed_decode_batch_k(float *h,
+                                      const int *tokens_dev, const int *S_dev,
+                                      const int *active, int B,
+                                      const __nv_bfloat16 *etw,
+                                      const __nv_bfloat16 *epw,
+                                      int D) {
+    int b = blockIdx.y;
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= B || d >= D || !active[b]) return;
+    int id  = tokens_dev[b];
+    int pos = S_dev[b] - 1;
+    h[(size_t)b * D + d] = __bfloat162float(etw[(size_t)id * D + d])
+                         + __bfloat162float(epw[(size_t)pos * D + d]);
+}
+
+extern "C" void backend_embed_decode_batch(float *h, const int *tokens,
+                                            const int *S_dev, const int *active, int B,
+                                            const uint16_t *etw, const uint16_t *epw,
+                                            const uint16_t *elnw, const uint16_t *elnb) {
+    /* Upload host arrays to per-thread device buffers. */
+    CUDA_CHECK(cudaMemcpyAsync(g_dev_cur_tokens, tokens, (size_t)B * sizeof(int),
+                               cudaMemcpyHostToDevice, g_stream));
+    CUDA_CHECK(cudaMemcpyAsync(g_dev_S_batch, S_dev, (size_t)B * sizeof(int),
+                               cudaMemcpyHostToDevice, g_stream));
+    CUDA_CHECK(cudaMemcpyAsync(g_dev_active, active, (size_t)B * sizeof(int),
+                               cudaMemcpyHostToDevice, g_stream));
+    dim3 grid((DEC_D + 255) / 256, B);
+    embed_decode_batch_k<<<grid, 256, 0, g_stream>>>(
+        h, g_dev_cur_tokens, g_dev_S_batch, g_dev_active, B,
+        (const __nv_bfloat16 *)dev_w(etw),
+        (const __nv_bfloat16 *)dev_w(epw),
+        DEC_D);
+    CUDA_CHECK(cudaStreamSynchronize(g_stream));
+    /* layernorm per active item (active is a host array — iterate directly). */
+    for (int b = 0; b < B; b++) {
+        if (!active[b]) continue;
+        backend_layernorm(h + (size_t)b * DEC_D, h + (size_t)b * DEC_D,
+                          elnw, elnb, 1, DEC_D);
+    }
+}
+
+/* LM head for B active items: logits[b*VOCAB..] from h[b*DEC_D..]. */
+__global__ void lm_head_batch_k(float *logits, const float *h,
+                                  const __nv_bfloat16 *etw, const __nv_bfloat16 *hdb,
+                                  const int *active, int B, int VOCAB_, int D) {
+    int b = blockIdx.z;
+    int v = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= B || v >= VOCAB_ || !active[b]) return;
+    float s = hdb ? __bfloat162float(hdb[v]) : 0.0f;
+    const float      *hb  = h      + (size_t)b * D;
+    const __nv_bfloat16 *ew = etw + (size_t)v * D;
+    for (int d = 0; d < D; d++) s += hb[d] * __bfloat162float(ew[d]);
+    logits[(size_t)b * VOCAB_ + v] = s;
+}
+
+extern "C" void backend_lm_head_batch(float *logits, const float *h,
+                                       const uint16_t *etw, const uint16_t *hdb,
+                                       const int *active, int B) {
+    CUDA_CHECK(cudaMemcpyAsync(g_dev_active, active, (size_t)B * sizeof(int),
+                               cudaMemcpyHostToDevice, g_stream));
+    dim3 grid((VOCAB + 255) / 256, 1, B);
+    lm_head_batch_k<<<grid, 256, 0, g_stream>>>(
+        logits, h,
+        (const __nv_bfloat16 *)dev_w(etw),
+        (const __nv_bfloat16 *)dev_w(hdb),
+        g_dev_active, B, VOCAB, DEC_D);
+}
+
+/* Argmax over VOCAB for each active item. */
+__global__ void argmax_batch_k(int *out, const float *logits,
+                                 const int *active, int B, int VOCAB_) {
+    int b = blockIdx.x;
+    if (b >= B || !active[b]) return;
+    const float *lg = logits + (size_t)b * VOCAB_;
+    int   best   = 0;
+    float best_v = lg[0];
+    for (int v = 1; v < VOCAB_; v++)
+        if (lg[v] > best_v) { best_v = lg[v]; best = v; }
+    out[b] = best;
+}
+
+extern "C" void backend_argmax_batch(int *out, const float *logits,
+                                      const int *active, int B) {
+    /* g_dev_active already uploaded by backend_lm_head_batch in the same step.
+     * Write results into g_dev_cur_tokens (available as scratch here). */
+    argmax_batch_k<<<B, 1, 0, g_stream>>>(g_dev_cur_tokens, logits, g_dev_active, B, VOCAB);
+    CUDA_CHECK(cudaStreamSynchronize(g_stream));
+    int tmp[MAX_BATCH];
+    CUDA_CHECK(cudaMemcpy(tmp, g_dev_cur_tokens, (size_t)B * sizeof(int), cudaMemcpyDeviceToHost));
+    for (int b = 0; b < B; b++) {
+        if (active[b]) out[b] = tmp[b];
+    }
+}
+
+/* ============================================================ */
+/* Batched decode helpers: linear-to-kvcache + batched SDP      */
+/* ============================================================ */
+
+extern "C" void backend_upload_T_enc(const int *T_enc, int B) {
+    CUDA_CHECK(cudaMemcpyAsync(g_dev_T_enc, T_enc, (size_t)B * sizeof(int),
+                               cudaMemcpyHostToDevice, g_stream));
+    CUDA_CHECK(cudaStreamSynchronize(g_stream));
+}
+
+/* Kernel: for each item b, compute a linear(x[b], W) and write the result
+ * into cache[b * cache_seq_stride * out_d + slot * out_d] where slot = S_dev[b]-1. */
+__global__ void linear_to_kvcache_batch_k(float *cache, const float *x,
+                                            const __nv_bfloat16 *W, const __nv_bfloat16 *b,
+                                            const int *S_dev, int B,
+                                            int cache_seq_stride, int in_d, int out_d) {
+    int bx = blockIdx.y;
+    int o  = blockIdx.x * blockDim.x + threadIdx.x;
+    if (bx >= B || o >= out_d) return;
+    int slot = S_dev[bx] - 1;
+    float s = b ? __bfloat162float(b[o]) : 0.0f;
+    const float         *xr = x + (size_t)bx * in_d;
+    const __nv_bfloat16 *wr = W + (size_t)o  * in_d;
+    for (int k = 0; k < in_d; k++) s += xr[k] * __bfloat162float(wr[k]);
+    cache[(size_t)bx * cache_seq_stride * out_d + (size_t)slot * out_d + o] = s;
+}
+
+extern "C" void backend_linear_to_kvcache_batch(float *cache, const float *x,
+                                                  const uint16_t *W, const uint16_t *b,
+                                                  int B, int cache_seq_stride,
+                                                  int in_d, int out_d) {
+    dim3 grid((out_d + 255)/256, B);
+    linear_to_kvcache_batch_k<<<grid, 256, 0, g_stream>>>(
+        cache, x,
+        (const __nv_bfloat16 *)dev_w(W), (const __nv_bfloat16 *)dev_w(b),
+        g_dev_S_batch, B, cache_seq_stride, in_d, out_d);
+}
+
+/* Score kernel: scores[b, h, ki] = scale * Q[b, h, :] · K[b, ki, h, :].
+ * Positions ki >= T_kv_dev[b] are skipped (scores buffer not written, never read). */
+__global__ void sdp_score_batch_decode_k(float *scores, const float *Q, const float *K,
+                                          float scale, const int *T_kv_dev,
+                                          int T_k_stride, int DK_, int D_, int B_) {
+    int ki = blockIdx.x * blockDim.x + threadIdx.x;
+    int h  = blockIdx.y;
+    int b  = blockIdx.z;
+    if (b >= B_ || ki >= T_k_stride) return;
+    int T_k = T_kv_dev[b];
+    if (ki >= T_k) return;
+    const float *Qb = Q + (size_t)b * D_;
+    const float *Kb = K + (size_t)b * T_k_stride * D_ + (size_t)ki * D_;
+    float s = 0.0f;
+    for (int d = 0; d < DK_; d++) s += Qb[h*DK_+d] * Kb[h*DK_+d];
+    scores[(size_t)(b * DEC_H + h) * T_k_stride + ki] = s * scale;
+}
+
+/* Softmax in-place over scores[bh * T_k_stride .. bh * T_k_stride + T_k-1]. */
+__global__ void softmax_batch_decode_k(float *scores, const int *T_kv_dev, int T_k_stride) {
+    int bh  = blockIdx.x;
+    int b   = bh / DEC_H;
+    int T_k = T_kv_dev[b];
+    float *row = scores + (size_t)bh * T_k_stride;
+
+    __shared__ float smem[33];
+
+    /* max */
+    float mx = -1e30f;
+    for (int i = threadIdx.x; i < T_k; i += blockDim.x) mx = fmaxf(mx, row[i]);
+    for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_down_sync(0xffffffff, mx, off));
+    if (threadIdx.x % 32 == 0) smem[threadIdx.x / 32] = mx;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m2 = smem[0]; int nw = (blockDim.x + 31)/32;
+        for (int i = 1; i < nw; i++) m2 = fmaxf(m2, smem[i]);
+        smem[32] = m2;
+    }
+    __syncthreads();
+    mx = smem[32];
+
+    /* exp + sum */
+    float s = 0.0f;
+    for (int i = threadIdx.x; i < T_k; i += blockDim.x) { row[i] = expf(row[i] - mx); s += row[i]; }
+    for (int off = 16; off > 0; off >>= 1) s += __shfl_down_sync(0xffffffff, s, off);
+    if (threadIdx.x % 32 == 0) smem[threadIdx.x / 32] = s;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float s2 = smem[0]; int nw = (blockDim.x + 31)/32;
+        for (int i = 1; i < nw; i++) s2 += smem[i]; smem[32] = s2;
+    }
+    __syncthreads();
+    s = smem[32];
+    for (int i = threadIdx.x; i < T_k; i += blockDim.x) row[i] /= s;
+}
+
+/* Aggregate: out[b, h*DK+d] = sum_{ki<T_k} scores[b,h,ki] * V[b,ki,h*DK+d]. */
+__global__ void sdp_aggregate_batch_decode_k(float *out, const float *scores, const float *V,
+                                               const int *T_kv_dev,
+                                               int T_k_stride, int DK_, int D_, int B_) {
+    int d  = blockIdx.x * blockDim.x + threadIdx.x;
+    int h  = blockIdx.y;
+    int b  = blockIdx.z;
+    if (b >= B_ || d >= DK_) return;
+    int T_k = T_kv_dev[b];
+    const float *sc = scores + (size_t)(b * DEC_H + h) * T_k_stride;
+    const float *Vb = V + (size_t)b * T_k_stride * D_;
+    float s = 0.0f;
+    for (int ki = 0; ki < T_k; ki++) s += sc[ki] * Vb[(size_t)ki*D_ + h*DK_+d];
+    out[(size_t)b * D_ + h*DK_+d] = s;
+}
+
+/* Shared implementation parameterised by which T_kv device array to use. */
+static void sdp_attn_batch_decode_impl(float *out, const float *Q,
+                                        const float *K, const float *V,
+                                        const int *T_kv_dev, int T_k_stride, int B, float *work) {
+    float *scores = work;  /* B * DEC_H * T_k_stride floats */
+    const float scale = 1.0f / sqrtf((float)DEC_DK);
+    {
+        dim3 grid((T_k_stride + 255)/256, DEC_H, B);
+        sdp_score_batch_decode_k<<<grid, 256, 0, g_stream>>>(
+            scores, Q, K, scale, T_kv_dev, T_k_stride, DEC_DK, DEC_D, B);
+    }
+    softmax_batch_decode_k<<<B * DEC_H, 256, 0, g_stream>>>(scores, T_kv_dev, T_k_stride);
+    {
+        dim3 grid((DEC_DK + 31)/32, DEC_H, B);
+        sdp_aggregate_batch_decode_k<<<grid, 32, 0, g_stream>>>(
+            out, scores, V, T_kv_dev, T_k_stride, DEC_DK, DEC_D, B);
+    }
+}
+
+extern "C" void backend_sdp_attn_batch_decode_sa(float *out, const float *Q,
+                                                   const float *K, const float *V,
+                                                   int T_k_stride, int B, float *work) {
+    sdp_attn_batch_decode_impl(out, Q, K, V, g_dev_S_batch, T_k_stride, B, work);
+}
+
+extern "C" void backend_sdp_attn_batch_decode_ca(float *out, const float *Q,
+                                                   const float *K, const float *V,
+                                                   int T_k_stride, int B, float *work) {
+    sdp_attn_batch_decode_impl(out, Q, K, V, g_dev_T_enc, T_k_stride, B, work);
 }

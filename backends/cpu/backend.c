@@ -26,9 +26,14 @@ int  backend_num_devices(void) {
 /* Token buffer: backend_embed_decode reads from here. */
 static _Thread_local int g_cpu_tokens[MAX_SEQ];
 void backend_upload_tokens(const int *t, int S) { memcpy(g_cpu_tokens, t, (size_t)S * sizeof(int)); }
-int  backend_graph_replay(int tag, int T, int S) { (void)tag; (void)T; (void)S; return 0; }
+
+/* Per-item batch state mirrors (set by backend_embed_decode_batch / backend_upload_T_enc). */
+#define MAX_BATCH 256
+static _Thread_local int g_cpu_S_batch[MAX_BATCH];
+static _Thread_local int g_cpu_T_enc_batch[MAX_BATCH];
+int  backend_graph_replay(int tag, int T, int S, int B) { (void)tag; (void)T; (void)S; (void)B; return 0; }
 void backend_graph_begin_capture(int tag) { (void)tag; }
-void backend_graph_end_capture(int tag, int T, int S) { (void)tag; (void)T; (void)S; }
+void backend_graph_end_capture(int tag, int T, int S, int B) { (void)tag; (void)T; (void)S; (void)B; }
 
 void backend_weights_upload_blob(const void *host_base, size_t bytes) {
     (void)host_base; (void)bytes;
@@ -180,7 +185,7 @@ void backend_add_inplace(float *dst, const float *src, int n) {
     for (int i = 0; i < n; i++) dst[i] += src[i];
 }
 
-void backend_encoder_subsampling(const float *mel, int T_mel,
+void backend_encoder_subsampling(const float *mel, int T_mel, int T_mel_stride,
                                   float *x_enc, int T_enc, float *work,
                                   const Weights *W) {
     const int T1 = (T_mel+1)/2, T2 = (T1+1)/2;
@@ -195,7 +200,7 @@ void backend_encoder_subsampling(const float *mel, int T_mel,
 
     for (int t = 0; t < T_mel; t++)
         for (int m = 0; m < N_MELS; m++)
-            mel_t[t * N_MELS + m] = mel[m * T_mel + t];
+            mel_t[t * N_MELS + m] = mel[m * T_mel_stride + t];
 
     conv2d(buf0, mel_t, W->s0w, W->s0b, 1, T_mel, N_MELS, SUB_CH, 3, 3, 2, 1, 1);
     relu(buf0, SUB_CH * T1 * F1);
@@ -411,4 +416,85 @@ void backend_embed_decode(float *h,
                           const uint16_t *etw, const uint16_t *epw,
                           const uint16_t *elnw, const uint16_t *elnb) {
     backend_embed(h, g_cpu_tokens, 1, g_cpu_S - 1, etw, epw, elnw, elnb);
+}
+
+/* ============================================================ */
+/* Batched decode-step helpers                                   */
+/* ============================================================ */
+
+void backend_embed_decode_batch(float *h, const int *tokens,
+                                 const int *S_dev, const int *active, int B,
+                                 const uint16_t *etw, const uint16_t *epw,
+                                 const uint16_t *elnw, const uint16_t *elnb) {
+    memcpy(g_cpu_S_batch, S_dev, (size_t)B * sizeof(int));
+    for (int b = 0; b < B; b++) {
+        if (!active[b]) continue;
+        backend_embed(h + (size_t)b * DEC_D, &tokens[b], 1, S_dev[b] - 1,
+                      etw, epw, elnw, elnb);
+    }
+}
+
+void backend_lm_head_batch(float *logits, const float *h,
+                            const uint16_t *etw, const uint16_t *hdb,
+                            const int *active, int B) {
+    for (int b = 0; b < B; b++) {
+        if (!active[b]) continue;
+        backend_lm_head(logits + (size_t)b * VOCAB, h + (size_t)b * DEC_D, etw, hdb);
+    }
+}
+
+void backend_argmax_batch(int *out, const float *logits,
+                           const int *active, int B) {
+    for (int b = 0; b < B; b++) {
+        if (!active[b]) continue;
+        const float *lg = logits + (size_t)b * VOCAB;
+        int best = 0; float best_v = lg[0];
+        for (int v = 1; v < VOCAB; v++)
+            if (lg[v] > best_v) { best_v = lg[v]; best = v; }
+        out[b] = best;
+    }
+}
+
+/* ============================================================ */
+/* Batched decode helpers                                        */
+/* ============================================================ */
+
+void backend_upload_T_enc(const int *T_enc, int B) {
+    memcpy(g_cpu_T_enc_batch, T_enc, (size_t)B * sizeof(int));
+}
+
+void backend_linear_to_kvcache_batch(float *cache, const float *x,
+                                      const uint16_t *W, const uint16_t *b,
+                                      int B, int cache_seq_stride,
+                                      int in_d, int out_d) {
+    for (int bi = 0; bi < B; bi++) {
+        int slot = g_cpu_S_batch[bi] - 1;
+        float *dst = cache + ((size_t)bi * cache_seq_stride + slot) * out_d;
+        const float *xb = x + (size_t)bi * in_d;
+        backend_linear(dst, xb, W, b, 1, in_d, out_d);
+    }
+}
+
+void backend_sdp_attn_batch_decode_sa(float *out, const float *Q,
+                                       const float *K, const float *V,
+                                       int T_k_stride, int B, float *work) {
+    for (int b = 0; b < B; b++) {
+        backend_sdp_attn(out + (size_t)b * DEC_D,
+                         Q   + (size_t)b * DEC_D,
+                         K   + (size_t)b * T_k_stride * DEC_D,
+                         V   + (size_t)b * T_k_stride * DEC_D,
+                         NULL, 1, g_cpu_S_batch[b], work);
+    }
+}
+
+void backend_sdp_attn_batch_decode_ca(float *out, const float *Q,
+                                       const float *K, const float *V,
+                                       int T_k_stride, int B, float *work) {
+    for (int b = 0; b < B; b++) {
+        backend_sdp_attn(out + (size_t)b * DEC_D,
+                         Q   + (size_t)b * DEC_D,
+                         K   + (size_t)b * T_k_stride * DEC_D,
+                         V   + (size_t)b * T_k_stride * DEC_D,
+                         NULL, 1, g_cpu_T_enc_batch[b], work);
+    }
 }
