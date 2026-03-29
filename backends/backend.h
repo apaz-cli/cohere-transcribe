@@ -9,6 +9,7 @@
 #ifndef BACKENDS_BACKEND_H
 #define BACKENDS_BACKEND_H
 
+#include "model_types.h"
 #include <stdint.h>
 #include <stddef.h>
 

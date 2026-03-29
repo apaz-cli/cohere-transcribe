@@ -263,7 +263,8 @@ static void print_tokens(const int *tokens, int start, int end, FILE *out) {
  * ============================================================ */
 static void transcribe_chunk(const float *samples, int n_samples,
                               const int *prompt_ids, int n_prompt, FILE *out,
-                              int *n_tokens_out) {
+                              int *n_tokens_out,
+                              int *carry_out, int *n_carry_out, int carry_cap) {
     const int T_mel = 1 + n_samples / HOP_LEN;
     const int T1    = (T_mel + 1) / 2;
     const int T2    = (T1   + 1) / 2;
@@ -300,9 +301,6 @@ static void transcribe_chunk(const float *samples, int n_samples,
     const size_t arena_floats = n_mel + n_xenc + n_posemb + n_ench
                               + 2*n_cakv + n_hdec + n_mask + 2*n_sakv + work_size;
 
-    if (verbose) fprintf(stderr, "  chunk %.2fs: T_enc=%d arena=%.1fMB\n",
-                         (float)n_samples / SR, T_enc,
-                         (double)arena_floats * sizeof(float) / (1024.0 * 1024.0));
 
     float *arena = backend_arena_alloc(arena_floats);
     if (!arena) { fputs("OOM\n", stderr); exit(1); }
@@ -378,6 +376,16 @@ static void transcribe_chunk(const float *samples, int n_samples,
 
     print_tokens(tokens, prompt_end, S, out);
     if (n_tokens_out) *n_tokens_out = S - prompt_end;
+    if (carry_out && n_carry_out) {
+        /* Carry the last carry_cap generated tokens (excluding EOS) as context
+         * for the next chunk's prompt. */
+        int gen = S - prompt_end;        /* includes EOS */
+        int n   = gen > 0 ? gen - 1 : 0; /* exclude EOS */
+        if (n > carry_cap) n = carry_cap;
+        *n_carry_out = n;
+        if (n > 0)
+            memcpy(carry_out, tokens + (S - 1 - n), (size_t)n * sizeof(int));
+    }
     backend_arena_free(arena);
 }
 
@@ -457,7 +465,79 @@ static int apply_target(int *splits, int n_splits, int target_samp) {
 }
 
 /* ============================================================
- * Parallel chunk runner
+ * transcribe_file_chunked: silence-split a long audio buffer and
+ * transcribe each chunk sequentially, threading the last CARRY_MAX
+ * generated tokens from chunk N into chunk N+1's prompt as context.
+ *
+ * The prompt is split at the SOC/SOT boundary (always at position 2):
+ *   pre  = [TOK_LEADING_SPACE, TOK_STARTOFCONTEXT]
+ *   post = [TOK_STARTOFTRANSCRIPT, TOK_EMO_UNDEFINED, lang×2, controls…]
+ * Carry tokens are inserted between pre and post so the model sees
+ * previous context before generating the new transcript.
+ * ============================================================ */
+#define CARRY_MAX 64
+
+static void transcribe_file_chunked(
+        const float *samples, int n_samples,
+        const int *prompt_ids, int n_prompt,
+        float opt_silence_db, float opt_silence_dur, float opt_target_sec,
+        FILE *out)
+{
+    int n_frames = n_samples / HOP_LEN;
+    float *frame_rms = malloc((size_t)n_frames * sizeof(float));
+    if (!frame_rms) { fputs("OOM\n", stderr); exit(1); }
+    compute_frame_rms(samples, n_frames, frame_rms);
+
+    float thresh_rms;
+    if (isnan(opt_silence_db)) {
+        thresh_rms = estimate_silence_thresh(frame_rms, n_frames);
+        if (verbose) fprintf(stderr, "  silence threshold: %.1f dB (auto)\n",
+                20.0f * log10f(thresh_rms + 1e-9f));
+    } else {
+        thresh_rms = powf(10.0f, opt_silence_db / 20.0f);
+    }
+
+    int splits[4096];
+    int n_splits = find_splits(frame_rms, n_frames, thresh_rms, opt_silence_dur,
+                               splits, 4096);
+    free(frame_rms);
+    n_splits = apply_target(splits, n_splits, (int)(opt_target_sec * SR));
+    if (verbose) fprintf(stderr, "  %d splits → %d chunks (target %.0fs)\n",
+                         n_splits, n_splits + 1, opt_target_sec);
+
+    /* prompt split: pre = prompt_ids[0..1], post = prompt_ids[2..n_prompt-1] */
+    const int n_pre  = 2;
+    const int n_post = n_prompt - n_pre;
+    const int *prompt_pre  = prompt_ids;
+    const int *prompt_post = prompt_ids + n_pre;
+
+    int carry[CARRY_MAX];
+    int n_carry = 0;
+    /* pre(2) + carry(≤64) + post(≤16) */
+    int prompt_buf[2 + CARRY_MAX + 16];
+    int start = 0;
+
+    for (int c = 0; c <= n_splits; c++) {
+        int end = (c < n_splits) ? splits[c] : n_samples;
+        if (end <= start) { start = end; continue; }
+
+        /* Build prompt: pre + carry + post */
+        int np = 0;
+        memcpy(prompt_buf + np, prompt_pre,  (size_t)n_pre   * sizeof(int)); np += n_pre;
+        memcpy(prompt_buf + np, carry,        (size_t)n_carry * sizeof(int)); np += n_carry;
+        memcpy(prompt_buf + np, prompt_post, (size_t)n_post  * sizeof(int)); np += n_post;
+
+        int n_tokens = 0;
+        transcribe_chunk(samples + start, end - start, prompt_buf, np, out, &n_tokens,
+                         carry, &n_carry, CARRY_MAX);
+        start = end;
+    }
+}
+
+/* ============================================================
+ * Parallel chunk runner (REMOVED — replaced by transcribe_file_chunked
+ * above for sequential carry-over within a file, and run_files_parallel
+ * below for inter-file parallelism across devices)
  *
  * To revert to sequential processing, delete this section and
  * replace the run_chunks_parallel() call in main with:
@@ -495,7 +575,8 @@ static void transcribe_batch(ChunkWork *jobs, int count,
         FILE *f = open_memstream(&jobs[0].text, &jobs[0].text_len);
         transcribe_chunk(jobs[0].samples, jobs[0].n_samples,
                          jobs[0].prompt_ids, jobs[0].n_prompt,
-                         f, &jobs[0].n_tokens);
+                         f, &jobs[0].n_tokens,
+                         NULL, NULL, 0);
         fclose(f);
         return;
     }
@@ -549,10 +630,6 @@ static void transcribe_batch(ChunkWork *jobs, int count,
                               + n_hdec + n_mask + n_logits + n_h_dec_b
                               + work_size;
 
-    if (verbose)
-        fprintf(stderr, "  batch %d chunks: T_enc_max=%d arena=%.1fMB\n",
-                count, T_enc_max,
-                (double)arena_floats * sizeof(float) / (1024.0*1024.0));
 
     float *arena = backend_arena_alloc(arena_floats);
     if (!arena) { fputs("OOM\n", stderr); exit(1); }
@@ -730,129 +807,180 @@ static void transcribe_batch(ChunkWork *jobs, int count,
     free(active); free(tokens_cur); free(next_tokens);
 }
 
+/* ============================================================
+ * File-level parallel processing
+ *
+ * run_files_parallel dispatches a list of audio files across the
+ * available devices.  Each device thread pulls batches of up to
+ * batch_size files from the queue.
+ *
+ * Non-chunked mode: files in a batch are encoded simultaneously via
+ * transcribe_batch, so batch_size controls encoder utilisation.
+ *
+ * Chunked mode: carry-over requires sequential processing within each
+ * file, so batch_size is ignored and each thread processes one file at
+ * a time (parallelism comes from multiple device threads).
+ * ============================================================ */
 typedef struct {
-    ChunkWork *jobs;
-    int        count;     /* number of jobs in this group (≤ batch_size) */
-} BatchGroup;
+    char *in_path;
+    char *out_path;  /* NULL → write to stdout */
+} FileJob;
 
 typedef struct {
-    BatchGroup     *groups;
-    int             n_groups;
-    int             next;      /* index of next unclaimed group */
-    int             completed; /* jobs completed so far (for progress reporting) */
-    int             n_jobs;    /* total individual chunks */
+    FileJob        *jobs;
+    int             n_jobs;
+    int             next;
+    int             completed;
     pthread_mutex_t mu;
-} Queue;
+} FileQueue;
 
 typedef struct {
-    Queue *q;
-    int    gpu_id;
-    int    batch_size;
-} WorkerArg;
+    FileQueue    *q;
+    int           device_id;
+    int           batch_size;
+    const int    *prompt_ids;
+    int           n_prompt;
+    int           opt_chunk;
+    float         opt_silence_db;
+    float         opt_silence_dur;
+    float         opt_target_sec;
+} FileWorkerArg;
 
-static int cmp_n_samples_desc(const void *a, const void *b) {
-    return ((const ChunkWork *)b)->n_samples - ((const ChunkWork *)a)->n_samples;
-}
+static void *file_worker(void *varg) {
+    FileWorkerArg *arg = (FileWorkerArg *)varg;
+    backend_init(arg->device_id);
+    FileQueue *q = arg->q;
 
-static void *worker(void *varg) {
-    WorkerArg *arg = (WorkerArg *)varg;
-    backend_init(arg->gpu_id);
-    Queue *q = arg->q;
     for (;;) {
         pthread_mutex_lock(&q->mu);
-        int gi = q->next++;
+        int start = q->next;
+        int end   = start + (arg->opt_chunk ? 1 : arg->batch_size);
+        if (end > q->n_jobs) end = q->n_jobs;
+        q->next = end;
         pthread_mutex_unlock(&q->mu);
-        if (gi >= q->n_groups) break;
-        BatchGroup *g = &q->groups[gi];
-        transcribe_batch(g->jobs, g->count,
-                         g->jobs[0].prompt_ids, g->jobs[0].n_prompt);
+        if (start >= q->n_jobs) break;
+        int count = end - start;
+
+        if (arg->opt_chunk) {
+            /* Sequential per-file with carry-over */
+            FileJob *job = &q->jobs[start];
+            int n_samples;
+            float *samples = load_audio(job->in_path, &n_samples);
+            FILE *out = job->out_path ? fopen(job->out_path, "w") : stdout;
+            if (!out) {
+                fprintf(stderr, "Cannot open %s\n", job->out_path);
+                free(samples);
+            } else {
+                transcribe_file_chunked(samples, n_samples,
+                                        arg->prompt_ids, arg->n_prompt,
+                                        arg->opt_silence_db,
+                                        arg->opt_silence_dur,
+                                        arg->opt_target_sec, out);
+                if (job->out_path) fclose(out);
+                free(samples);
+            }
+        } else {
+            /* Load each file; auto-chunk files > 30 s, batch the rest. */
+            ChunkWork *batch     = calloc((size_t)count, sizeof(ChunkWork));
+            int       *batch_job = calloc((size_t)count, sizeof(int));
+            if (!batch || !batch_job) { fputs("OOM\n", stderr); exit(1); }
+            int n_batch = 0;
+
+            for (int i = 0; i < count; i++) {
+                FileJob *job = &q->jobs[start + i];
+                int n_samples;
+                float *samples = load_audio(job->in_path, &n_samples);
+
+                if (n_samples > (int)(SR * 30.0f)) {
+                    /* Long file: chunk immediately rather than trying to batch. */
+                    FILE *out = job->out_path ? fopen(job->out_path, "w") : stdout;
+                    if (!out) {
+                        fprintf(stderr, "Cannot open %s\n", job->out_path);
+                    } else {
+                        transcribe_file_chunked(samples, n_samples,
+                                                arg->prompt_ids, arg->n_prompt,
+                                                arg->opt_silence_db,
+                                                arg->opt_silence_dur,
+                                                arg->opt_target_sec, out);
+                        if (job->out_path) fclose(out);
+                    }
+                    free(samples);
+                } else {
+                    batch[n_batch].samples    = samples;
+                    batch[n_batch].n_samples  = n_samples;
+                    batch[n_batch].prompt_ids = arg->prompt_ids;
+                    batch[n_batch].n_prompt   = arg->n_prompt;
+                    batch[n_batch].orig_idx   = n_batch;
+                    batch_job[n_batch]        = i;
+                    n_batch++;
+                }
+            }
+
+            if (n_batch > 0) {
+                transcribe_batch(batch, n_batch, arg->prompt_ids, arg->n_prompt);
+                for (int i = 0; i < n_batch; i++) {
+                    FileJob *job = &q->jobs[start + batch_job[i]];
+                    FILE *out = job->out_path ? fopen(job->out_path, "w") : stdout;
+                    if (!out) {
+                        fprintf(stderr, "Cannot open %s\n", job->out_path);
+                    } else {
+                        fwrite(batch[i].text, 1, batch[i].text_len, out);
+                        if (job->out_path) fclose(out);
+                    }
+                    free(batch[i].text);
+                    free((void *)batch[i].samples);
+                }
+            }
+            free(batch);
+            free(batch_job);
+        }
+
         pthread_mutex_lock(&q->mu);
-        int done = (q->completed += g->count);
+        int done = (q->completed += count);
         pthread_mutex_unlock(&q->mu);
-        if (verbose) fprintf(stderr, "[%d/%d batch=%d]\n", done, q->n_jobs, g->count);
+        if (verbose) fprintf(stderr, "[%d/%d]\n", done, q->n_jobs);
     }
     backend_thread_cleanup();
     return NULL;
 }
 
-static void run_chunks_parallel(const float *samples,
-                                const int *splits, int n_splits, int n_samples,
+static void run_files_parallel(FileJob *jobs, int n_jobs,
+                                const int *device_ids, int n_devices,
+                                int batch_size,
                                 const int *prompt_ids, int n_prompt,
-                                int batch_size, FILE *out) {
-    /* Build job list, skipping zero-length chunks */
-    int n_chunks = n_splits + 1;
-    ChunkWork *jobs = calloc((size_t)n_chunks, sizeof(ChunkWork));
-    if (!jobs) { fputs("OOM\n", stderr); exit(1); }
+                                int opt_chunk,
+                                float opt_silence_db, float opt_silence_dur,
+                                float opt_target_sec) {
+    if (n_jobs == 0) return;
+    int nthreads = n_devices < n_jobs ? n_devices : n_jobs;
+    if (verbose)
+        fprintf(stderr, "  processing %d file(s) on %d thread(s) (batch_size=%d%s)\n",
+                n_jobs, nthreads, opt_chunk ? 1 : batch_size,
+                opt_chunk ? ", chunked" : "");
 
-    int n_jobs = 0, start = 0;
-    for (int c = 0; c < n_chunks; c++) {
-        int end = (c < n_splits) ? splits[c] : n_samples;
-        if (end > start) {
-            jobs[n_jobs].samples    = samples + start;
-            jobs[n_jobs].n_samples  = end - start;
-            jobs[n_jobs].prompt_ids = prompt_ids;
-            jobs[n_jobs].n_prompt   = n_prompt;
-            jobs[n_jobs].orig_idx   = n_jobs;
-            n_jobs++;
-        }
-        start = end;
-    }
-
-    /* Sort jobs by length descending so batches contain similarly-sized chunks,
-     * minimising padding in the encoder.  orig_idx preserves audio ordering. */
-    qsort(jobs, (size_t)n_jobs, sizeof(ChunkWork), cmp_n_samples_desc);
-
-    /* Partition into batch groups */
-    int n_groups = (n_jobs + batch_size - 1) / batch_size;
-    BatchGroup *groups = calloc((size_t)n_groups, sizeof(BatchGroup));
-    if (!groups) { fputs("OOM\n", stderr); exit(1); }
-    for (int g = 0; g < n_groups; g++) {
-        groups[g].jobs  = jobs + g * batch_size;
-        groups[g].count = (g * batch_size + batch_size <= n_jobs)
-                          ? batch_size : (n_jobs - g * batch_size);
-    }
-
-    int n_devices = backend_num_devices();
-    long nthreads = n_devices;
-    if (nthreads < 1) nthreads = 1;
-    if (nthreads > n_groups) nthreads = n_groups;
-    if (verbose) fprintf(stderr, "  running %d chunks in %d batch(es) on %ld thread(s)\n",
-                         n_jobs, n_groups, nthreads);
-    pthread_t  *tids = calloc((size_t)nthreads, sizeof(pthread_t));
-    WorkerArg  *args = calloc((size_t)nthreads, sizeof(WorkerArg));
+    FileQueue q = { jobs, n_jobs, 0, 0, PTHREAD_MUTEX_INITIALIZER };
+    pthread_t     *tids = calloc((size_t)nthreads, sizeof(pthread_t));
+    FileWorkerArg *args = calloc((size_t)nthreads, sizeof(FileWorkerArg));
     if (!tids || !args) { fputs("OOM\n", stderr); exit(1); }
 
-    Queue q = { groups, n_groups, 0, 0, n_jobs, PTHREAD_MUTEX_INITIALIZER };
-    for (int i = 0; i < (int)nthreads; i++) {
-        args[i].q          = &q;
-        args[i].gpu_id     = i % n_devices;
-        args[i].batch_size = batch_size;
-        pthread_create(&tids[i], NULL, worker, &args[i]);
+    for (int i = 0; i < nthreads; i++) {
+        args[i].q               = &q;
+        args[i].device_id       = device_ids[i % n_devices];
+        args[i].batch_size      = batch_size;
+        args[i].prompt_ids      = prompt_ids;
+        args[i].n_prompt        = n_prompt;
+        args[i].opt_chunk       = opt_chunk;
+        args[i].opt_silence_db  = opt_silence_db;
+        args[i].opt_silence_dur = opt_silence_dur;
+        args[i].opt_target_sec  = opt_target_sec;
+        pthread_create(&tids[i], NULL, file_worker, &args[i]);
     }
-    for (int i = 0; i < (int)nthreads; i++)
+    for (int i = 0; i < nthreads; i++)
         pthread_join(tids[i], NULL);
 
-    /* Restore audio order: jobs were sorted by length, output must follow
-     * the original silence-split sequence. */
-    char   **texts     = calloc((size_t)n_jobs, sizeof(char *));
-    size_t  *text_lens = calloc((size_t)n_jobs, sizeof(size_t));
-    if (!texts || !text_lens) { fputs("OOM\n", stderr); exit(1); }
-    for (int i = 0; i < n_jobs; i++) {
-        texts    [jobs[i].orig_idx] = jobs[i].text;
-        text_lens[jobs[i].orig_idx] = jobs[i].text_len;
-    }
-    for (int i = 0; i < n_jobs; i++) {
-        fwrite(texts[i], 1, text_lens[i], out);
-        free(texts[i]);
-    }
-    free(texts);
-    free(text_lens);
-
     pthread_mutex_destroy(&q.mu);
-    free(groups);
-    free(args);
     free(tids);
-    free(jobs);
+    free(args);
 }
 
 /* ============================================================
@@ -861,7 +989,7 @@ static void run_chunks_parallel(const float *samples,
  * ============================================================ */
 static int do_transcribe_file(const char *audio_file, FILE *out,
                                const int *prompt_ids, int n_prompt,
-                               int opt_chunk, int opt_batch_size,
+                               int opt_chunk,
                                float opt_silence_db, float opt_silence_dur,
                                float opt_target_sec) {
     int n_samples;
@@ -869,13 +997,11 @@ static int do_transcribe_file(const char *audio_file, FILE *out,
     float *samples = load_audio(audio_file, &n_samples);
     if (verbose) fprintf(stderr, "  Loaded %.2fs of audio\n", (float)n_samples / SR);
 
-    if (!opt_chunk && n_samples > SR * 120) {
-        fprintf(stderr,
-            "Error: %.0fs of audio is too long for single-pass mode.\n"
-            "Use --chunk to split on silence and transcribe in segments.\n",
-            (float)n_samples / SR);
-        free(samples);
-        return 1;
+    /* Auto-enable chunking for files longer than 30 s. */
+    if (!opt_chunk && n_samples > (int)(SR * 30.0f)) {
+        if (verbose) fprintf(stderr, "  %.1fs > 30s — auto-enabling chunked mode\n",
+                             (float)n_samples / SR);
+        opt_chunk = 1;
     }
 
     struct timespec t0, t1;
@@ -884,34 +1010,12 @@ static int do_transcribe_file(const char *audio_file, FILE *out,
     if (!opt_chunk) {
         if (verbose) fprintf(stderr, "Transcribing %.2fs single-pass ...\n", (float)n_samples / SR);
         int n_tokens = 0;
-        transcribe_chunk(samples, n_samples, prompt_ids, n_prompt, out, &n_tokens);
+        transcribe_chunk(samples, n_samples, prompt_ids, n_prompt, out, &n_tokens,
+                         NULL, NULL, 0);
         if (verbose) fprintf(stderr, "  %d tokens\n", n_tokens);
     } else {
-        int n_frames = n_samples / HOP_LEN;
-        float *frame_rms = malloc(n_frames * sizeof(float));
-        if (!frame_rms) { fputs("OOM\n", stderr); free(samples); return 1; }
-        compute_frame_rms(samples, n_frames, frame_rms);
-
-        float thresh_rms;
-        if (isnan(opt_silence_db)) {
-            thresh_rms = estimate_silence_thresh(frame_rms, n_frames);
-            if (verbose) fprintf(stderr, "  silence threshold: %.1f dB (auto)\n",
-                    20.0f * log10f(thresh_rms + 1e-9f));
-        } else {
-            thresh_rms = powf(10.0f, opt_silence_db / 20.0f);
-        }
-
-        int splits[4096];
-        int n_splits = find_splits(frame_rms, n_frames,
-                                   thresh_rms, opt_silence_dur,
-                                   splits, 4096);
-        free(frame_rms);
-        n_splits = apply_target(splits, n_splits, (int)(opt_target_sec * SR));
-        if (verbose) fprintf(stderr, "  %d splits → %d chunks (target %.0fs)\n",
-                             n_splits, n_splits + 1, opt_target_sec);
-
-        run_chunks_parallel(samples, splits, n_splits, n_samples, prompt_ids, n_prompt,
-                            opt_batch_size, out);
+        transcribe_file_chunked(samples, n_samples, prompt_ids, n_prompt,
+                                opt_silence_db, opt_silence_dur, opt_target_sec, out);
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -1003,7 +1107,7 @@ static void ffprobe_batch(char **paths, int n, int *results) {
  * ============================================================ */
 static void run_watch(const char *input_folder, const char *output_folder,
                       const int *prompt_ids, int n_prompt,
-                      int opt_chunk, int opt_batch_size,
+                      int opt_chunk,
                       float opt_silence_db, float opt_silence_dur,
                       float opt_target_sec) {
     /* ------ initial scan: process any files not yet transcribed ------ */
@@ -1060,7 +1164,7 @@ static void run_watch(const char *input_folder, const char *output_folder,
         FILE *out = fopen(out_path, "w");
         if (!out) { fprintf(stderr, "Cannot open %s\n", out_path); free(entries[f]); free(in_paths[f]); continue; }
         do_transcribe_file(in_paths[f], out, prompt_ids, n_prompt,
-                           opt_chunk, opt_batch_size,
+                           opt_chunk,
                            opt_silence_db, opt_silence_dur, opt_target_sec);
         fclose(out);
         free(entries[f]); free(in_paths[f]);
@@ -1115,7 +1219,7 @@ static void run_watch(const char *input_folder, const char *output_folder,
             FILE *out = fopen(out_path, "w");
             if (!out) { fprintf(stderr, "Cannot open %s\n", out_path); continue; }
             do_transcribe_file(in_path, out, prompt_ids, n_prompt,
-                               opt_chunk, opt_batch_size,
+                               opt_chunk,
                                opt_silence_db, opt_silence_dur, opt_target_sec);
             fclose(out);
         }
@@ -1134,6 +1238,7 @@ int main(int argc, char **argv) {
     int opt_diarize               = 0;
     int opt_chunk                 = 0;
     int opt_batch_size            = 1;
+    const char *opt_device        = NULL;  /* --device cpu|cuda|cuda:N */
     float opt_silence_db          = NAN;   /* NAN = auto-estimate from recording */
     float opt_silence_dur         = 0.2f;
     float opt_target_sec          = 20.0f;
@@ -1152,6 +1257,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--diarize")          == 0) opt_diarize = 1;
         else if (strcmp(argv[i], "--chunk")            == 0) opt_chunk = 1;
         else if (strcmp(argv[i], "--batch-size")       == 0 && i+1 < argc) opt_batch_size  = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--device")           == 0 && i+1 < argc) opt_device      = argv[++i];
         else if (strcmp(argv[i], "--silence-db")       == 0 && i+1 < argc) opt_silence_db  = atof(argv[++i]);
         else if (strcmp(argv[i], "--silence-dur")      == 0 && i+1 < argc) opt_silence_dur = atof(argv[++i]);
         else if (strcmp(argv[i], "--target-sec")       == 0 && i+1 < argc) opt_target_sec  = atof(argv[++i]);
@@ -1165,10 +1271,10 @@ int main(int argc, char **argv) {
         else if (argv[i][0] == '-') {
             fprintf(stderr, "Unknown flag: %s\n", argv[i]);
             fprintf(stderr,
-                "Usage: %s [-v] [--lang CODE] [--no-pnc] [--itn] [--timestamps] [--diarize]\n"
-                "       [--chunk [--batch-size N] [--silence-db DB] [--silence-dur SEC]\n"
-                "        [--target-sec SEC]]\n"
-                "       [-o OUTPUT_FILE] audio_file\n"
+                "Usage: %s [-v] [--device cpu|cuda|cuda:N|npu|xdna|xdna2|iron]\n"
+                "       [--lang CODE] [--no-pnc] [--itn] [--timestamps] [--diarize]\n"
+                "       [--chunk [--silence-db DB] [--silence-dur SEC] [--target-sec SEC]]\n"
+                "       [--batch-size N] [-o OUTPUT_FILE] audio_file\n"
                 "       --input_folder DIR [--output_folder DIR] [--skip_existing_output]\n",
                 argv[0]);
             return 1;
@@ -1179,10 +1285,10 @@ int main(int argc, char **argv) {
     int has_positional = (i < argc);
     if (!has_positional && !opt_input_folder) {
         fprintf(stderr,
-            "Usage: %s [-v] [--lang CODE] [--no-pnc] [--itn] [--timestamps] [--diarize]\n"
-            "       [--chunk [--batch-size N] [--silence-db DB] [--silence-dur SEC]\n"
-            "        [--target-sec SEC]]\n"
-            "       [-o OUTPUT_FILE] audio_file\n"
+            "Usage: %s [-v] [--device cpu|cuda|cuda:N]\n"
+            "       [--lang CODE] [--no-pnc] [--itn] [--timestamps] [--diarize]\n"
+            "       [--chunk [--silence-db DB] [--silence-dur SEC] [--target-sec SEC]]\n"
+            "       [--batch-size N] [-o OUTPUT_FILE] audio_file\n"
             "       --input_folder DIR [--output_folder DIR] [--skip_existing_output]\n",
             argv[0]);
         return 1;
@@ -1223,9 +1329,41 @@ int main(int argc, char **argv) {
     prompt_ids[n_prompt++] = opt_timestamps ? TOK_TIMESTAMP : TOK_NOTIMESTAMP;
     prompt_ids[n_prompt++] = opt_diarize    ? TOK_DIARIZE   : TOK_NODIARIZE;
 
+    /* ---- Resolve device list ----
+     * --device cpu       → single CPU device (id 0)
+     * --device cuda      → all available CUDA devices
+     * --device cuda:N    → single CUDA device N
+     * (default)          → all available devices
+     * CUDA_VISIBLE_DEVICES is respected by the CUDA runtime automatically.
+     */
+    int device_ids_buf[256];
+    int n_device_ids;
+    if (opt_device == NULL || strcmp(opt_device, "cuda") == 0 ||
+        strcmp(opt_device, "npu")   == 0 ||
+        strcmp(opt_device, "xdna")  == 0 ||
+        strcmp(opt_device, "xdna2") == 0 ||
+        strcmp(opt_device, "iron")  == 0) {
+        n_device_ids = backend_num_devices();
+        if (n_device_ids < 1) n_device_ids = 1;
+        for (int d = 0; d < n_device_ids; d++) device_ids_buf[d] = d;
+    } else if (strcmp(opt_device, "cpu") == 0) {
+        n_device_ids = 1;
+        device_ids_buf[0] = 0;
+    } else if (strncmp(opt_device, "cuda:", 5) == 0) {
+        n_device_ids = 1;
+        device_ids_buf[0] = atoi(opt_device + 5);
+    } else {
+        fprintf(stderr, "Unknown device '%s' — use cpu, cuda, cuda:N, or npu/xdna/xdna2/iron\n",
+                opt_device);
+        return 1;
+    }
+    int *device_ids = device_ids_buf;
+
     if (verbose) {
-        fprintf(stderr, "Options: lang=%s pnc=%d itn=%d timestamps=%d diarize=%d chunk=%d",
-                lang, opt_pnc, opt_itn, opt_timestamps, opt_diarize, opt_chunk);
+        fprintf(stderr, "Options: lang=%s pnc=%d itn=%d timestamps=%d diarize=%d chunk=%d"
+                        " batch_size=%d devices=%d",
+                lang, opt_pnc, opt_itn, opt_timestamps, opt_diarize, opt_chunk,
+                opt_batch_size, n_device_ids);
         if (opt_chunk)
             fprintf(stderr, " silence_dur=%.2fs target=%.0fs%s",
                     opt_silence_dur, opt_target_sec,
@@ -1238,7 +1376,7 @@ int main(int argc, char **argv) {
 #if defined(BACKEND_CUDA) && !defined(EMBEDDED_MODEL)
     backend_weights_upload_blob(sf_data, sf_data_bytes);
 #endif
-    backend_init(0);
+    backend_init(device_ids[0]);
 
     init_hann();
     init_mel_filterbank();
@@ -1248,10 +1386,10 @@ int main(int argc, char **argv) {
     if (opt_watch) {
         run_watch(opt_input_folder, opt_output_folder,
                   prompt_ids, n_prompt,
-                  opt_chunk, opt_batch_size,
+                  opt_chunk,
                   opt_silence_db, opt_silence_dur, opt_target_sec);
     } else if (opt_input_folder) {
-        /* --input_folder mode: iterate over audio files in the directory */
+        /* --input_folder mode: collect audio files, batch across devices */
         DIR *dir = opendir(opt_input_folder);
         if (!dir) {
             perror(opt_input_folder);
@@ -1259,7 +1397,6 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        /* Collect and sort entries for deterministic ordering */
         char **entries = NULL;
         int n_entries = 0, cap_entries = 0;
         struct dirent *de;
@@ -1275,13 +1412,12 @@ int main(int argc, char **argv) {
         }
         closedir(dir);
 
-        /* Sort alphabetically */
         int cmp_str(const void *a, const void *b) {
             return strcmp(*(const char **)a, *(const char **)b);
         }
         qsort(entries, (size_t)n_entries, sizeof(char *), cmp_str);
 
-        /* Build full paths and probe them all in parallel */
+        /* Build full input paths and probe them all in parallel */
         char **in_paths = malloc((size_t)n_entries * sizeof(char *));
         int  *is_audio  = malloc((size_t)n_entries * sizeof(int));
         if (!in_paths || !is_audio) { fputs("OOM\n", stderr); backend_destroy(); return 1; }
@@ -1293,61 +1429,57 @@ int main(int argc, char **argv) {
         if (n_entries > 0)
             ffprobe_batch(in_paths, n_entries, is_audio);
 
+        /* Build FileJob list, skipping non-audio and already-transcribed files */
+        FileJob *jobs = malloc((size_t)n_entries * sizeof(FileJob));
+        if (!jobs) { fputs("OOM\n", stderr); backend_destroy(); return 1; }
+        int n_jobs = 0;
         for (int f = 0; f < n_entries; f++) {
-            const char *in_path = in_paths[f];
-
             if (!is_audio[f]) {
-                if (verbose) fprintf(stderr, "Skipping %s (not recognized as audio by ffprobe)\n", entries[f]);
-                free(entries[f]);
-                free(in_paths[f]);
+                if (verbose)
+                    fprintf(stderr, "Skipping %s (not recognized as audio by ffprobe)\n",
+                            entries[f]);
+                free(entries[f]); free(in_paths[f]);
                 continue;
             }
 
-            FILE *out = stdout;
-            char out_path[4096];
-            out_path[0] = '\0';
-
+            char *out_path = NULL;
             if (opt_output_folder) {
-                /* Strip extension, append .txt */
                 char base[1024];
                 snprintf(base, sizeof(base), "%s", entries[f]);
                 char *dot = strrchr(base, '.');
                 if (dot) *dot = '\0';
-                snprintf(out_path, sizeof(out_path), "%s/%s.txt",
-                         opt_output_folder, base);
+                out_path = malloc(4096);
+                if (!out_path) { fputs("OOM\n", stderr); backend_destroy(); return 1; }
+                snprintf(out_path, 4096, "%s/%s.txt", opt_output_folder, base);
 
                 if (opt_skip_existing) {
                     struct stat st;
                     if (stat(out_path, &st) == 0) {
                         if (verbose) fprintf(stderr, "Skipping %s (output exists)\n", entries[f]);
-                        free(entries[f]);
+                        free(entries[f]); free(in_paths[f]); free(out_path);
                         continue;
                     }
                 }
-
-                out = fopen(out_path, "w");
-                if (!out) {
-                    fprintf(stderr, "Cannot open output file: %s\n", out_path);
-                    free(entries[f]);
-                    free(in_paths[f]);
-                    ret = 1;
-                    continue;
-                }
             }
 
-            if (do_transcribe_file(in_path, out, prompt_ids, n_prompt,
-                                   opt_chunk, opt_batch_size,
-                                   opt_silence_db, opt_silence_dur,
-                                   opt_target_sec) != 0)
-                ret = 1;
-
-            if (out != stdout) fclose(out);
+            jobs[n_jobs].in_path  = in_paths[f];
+            jobs[n_jobs].out_path = out_path;
+            n_jobs++;
             free(entries[f]);
-            free(in_paths[f]);
         }
         free(entries);
-        free(in_paths);
         free(is_audio);
+
+        run_files_parallel(jobs, n_jobs, device_ids, n_device_ids,
+                           opt_batch_size, prompt_ids, n_prompt,
+                           opt_chunk,
+                           opt_silence_db, opt_silence_dur, opt_target_sec);
+
+        for (int j = 0; j < n_jobs; j++) {
+            free(jobs[j].in_path);
+            free(jobs[j].out_path);
+        }
+        free(jobs);
 
     } else {
         /* Single-file mode */
@@ -1364,7 +1496,7 @@ int main(int argc, char **argv) {
         }
 
         ret = do_transcribe_file(audio_file, out, prompt_ids, n_prompt,
-                                 opt_chunk, opt_batch_size,
+                                 opt_chunk,
                                  opt_silence_db, opt_silence_dur,
                                  opt_target_sec);
 

@@ -366,12 +366,12 @@ static void precompute_ca_kv(const float *enc_h, int T_mel, int T_enc,
 /* ============================================================
  * Decoder layer with KV cache
  *
- * h         (S_q, DEC_D) — query token embeddings (1 during decode, n_prompt during prefill)
- * sa_k_cache (S_kv, DEC_D) — accumulated self-attn K cache for this layer
- * sa_v_cache (S_kv, DEC_D) — accumulated self-attn V cache for this layer
- * S_q       — number of new query tokens being processed
- * S_kv      — total KV sequence length after this step (S_q tokens appended to prior S_kv-S_q)
- * mask      — (S_q, S_kv) additive bias, or NULL (pass NULL during decode, S_q==1)
+ * h           (S_q, DEC_D) — query token embeddings (1 during decode, n_prompt during prefill)
+ * sa_k_cache  (S_kv, DEC_D) — accumulated self-attn K cache for this layer
+ * sa_v_cache  (S_kv, DEC_D) — accumulated self-attn V cache for this layer
+ * S_q         number of new query tokens being processed
+ * S_kv        total KV sequence length after this step (S_q tokens appended to prior S_kv-S_q)
+ * mask        (S_q, S_kv) additive bias, or NULL (pass NULL during decode, S_q==1)
  * ============================================================ */
 static void decoder_layer(float *h, const float *ca_k, const float *ca_v,
                           const float *mask, int S_q, int S_kv, int T_enc,
